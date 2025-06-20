@@ -18,14 +18,7 @@ import socket
 from concurrent.futures import ThreadPoolExecutor
 
 # Setup advanced logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('trade_copier.log', encoding='utf-8')
-    ]
-)
+
 logger = logging.getLogger(__name__)
 
 # Constants for ultra-reliable execution
