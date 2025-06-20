@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 import threading
 import logging
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 import json
 import urllib.parse
 import argparse
@@ -16,17 +16,89 @@ from collections import deque
 from typing import Dict, Set, Deque, Optional
 import socket
 from concurrent.futures import ThreadPoolExecutor
-import psutil  # Add at top with other imports
+import psutil
 import subprocess
 import atexit
 import random
 import signal
-import requests  # Add requests for API calls
-from threading import Lock, Event
-from contextlib import closing
+import requests
+from werkzeug.serving import make_server
+import requests.adapters
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 # Setup advanced logging
 logger = logging.getLogger(__name__)
+
+# Constants for connection pool
+MAX_WORKERS = 10
+POOL_CONNECTIONS = 100
+POOL_MAXSIZE = 100
+POOL_TIMEOUT = 30
+KEEP_ALIVE = True
+
+# Add connection pool for requests
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(
+    pool_connections=POOL_CONNECTIONS,
+    pool_maxsize=POOL_MAXSIZE,
+    max_retries=3,
+    pool_block=False
+)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+
+def create_app():
+    app = Flask(__name__)
+    app.wsgi_app = ProxyFix(app.wsgi_app)
+    return app
+
+app = create_app()
+
+# Configure Flask server with connection pool
+def start_flask_server():
+    """Start Flask server with connection pooling"""
+    logger.info(f"Starting Flask server with connection pool on localhost:{PORT}...")
+    try:
+        # Ensure port is available
+        if not ensure_port_available():
+            logger.error("Could not secure port 3000")
+            sys.exit(1)
+            
+        # Start port monitor
+        port_monitor = PortMonitor()
+        port_monitor.start()
+        
+        # Create server with threading
+        server = make_server('localhost', PORT, app, threaded=True)
+        
+        # Create thread pool for request handling
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        
+        @app.before_request
+        def before_request():
+            if not hasattr(g, 'executor'):
+                g.executor = executor
+        
+        @app.teardown_appcontext
+        def teardown_appcontext(exception=None):
+            executor = getattr(g, 'executor', None)
+            if executor:
+                executor.shutdown(wait=False)
+        
+        # Start server
+        server.serve_forever()
+        
+    except Exception as e:
+        logger.error(f"Error starting Flask server: {e}")
+        logger.exception("Full traceback:")
+        
+    finally:
+        # Cleanup
+        try:
+            executor.shutdown(wait=False)
+            server.server_close()
+        except:
+            pass
 
 # Add Xano API constants
 
@@ -56,72 +128,6 @@ PORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eibmemory.
 
 # Add these constants
 CMDLINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uirobot_cmdline.txt')
-
-# Add these global locks
-trade_data_lock = Lock()
-active_trades_lock = Lock()
-known_refs_lock = Lock()
-cleanup_lock = Lock()
-shutdown_event = Event()
-
-# Add these constants near other constants
-HOST = '0.0.0.0'  # Listen on all available interfaces
-SOCKET_TIMEOUT = 3  # Socket timeout in seconds
-SOCKET_BACKLOG = 5  # Socket backlog for pending connections
-SO_REUSEADDR = True  # Allow socket address reuse
-
-class SocketManager:
-    def __init__(self):
-        self.socket_lock = Lock()
-        self.bound_socket = None
-        
-    def bind_socket(self):
-        """Bind to socket with proper error handling and address reuse"""
-        with self.socket_lock:
-            try:
-                if self.bound_socket:
-                    try:
-                        self.bound_socket.close()
-                    except:
-                        pass
-                
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.settimeout(SOCKET_TIMEOUT)
-                
-                # Try to bind to all interfaces first
-                try:
-                    sock.bind((HOST, PORT))
-                    logger.info(f"Bound to all interfaces ({HOST}:{PORT})")
-                except socket.error:
-                    # Fall back to localhost if binding to all interfaces fails
-                    try:
-                        sock.bind(('127.0.0.1', PORT))
-                        logger.info(f"Bound to localhost (127.0.0.1:{PORT})")
-                    except socket.error as e:
-                        logger.error(f"Could not bind to any interface: {e}")
-                        return False
-                
-                sock.listen(SOCKET_BACKLOG)
-                self.bound_socket = sock
-                return True
-                
-            except Exception as e:
-                logger.error(f"Error binding socket: {e}")
-                return False
-    
-    def release_socket(self):
-        """Safely release bound socket"""
-        with self.socket_lock:
-            if self.bound_socket:
-                try:
-                    self.bound_socket.close()
-                except:
-                    pass
-                self.bound_socket = None
-
-# Create global socket manager
-socket_manager = SocketManager()
 
 def find_free_port():
     """Find a free port in the range 3000-3999"""
@@ -575,16 +581,22 @@ app.logger.setLevel(logging.INFO)
 
 @app.route('/trades', methods=['POST'])
 def receive_trades():
-    """Receive trade data via POST request - handles both JSON and plain text - ALWAYS returns 200"""
+    """Receive trade data via POST request with connection pooling"""
     global received_trade_data
     
     logger.info("Received POST request to /trades")
     
+    # Get executor from context
+    executor = getattr(g, 'executor', None)
+    if not executor:
+        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        g.executor = executor
+    
     data = None
     error_messages = []
     
-    # Try to get data from request
     try:
+        # Use connection pool for request handling
         if request.is_json:
             data = request.get_json()
             logger.info(f"Received JSON data: {data}")
@@ -597,106 +609,81 @@ def receive_trades():
                 logger.info("Empty text data received - will close all trades")
                 data = []  # Empty data means close all trades
             else:
-                # Parse text data
-                data = parse_text_data(text_data)
+                # Parse text data using thread pool
+                future = executor.submit(parse_text_data, text_data)
+                data = future.result(timeout=POOL_TIMEOUT)
                 logger.info(f"Parsed text to data: {data}")
-                
     except Exception as e:
         error_msg = f"Error parsing request data: {str(e)}"
         logger.warning(error_msg)
         error_messages.append(error_msg)
-        data = []  # Default to empty data
-    
-    # If no data was parsed, that's okay - it means close all trades
-    if data is None:
-        logger.info("No data received - treating as close all trades command")
         data = []
     
-    # Parse the received data
-    trades = []
-    
-    try:
-        # Handle both single trade and array of trades
-        if isinstance(data, list):
-            trade_list = data
-        else:
-            trade_list = [data] if data else []
-        
-        logger.info(f"Processing {len(trade_list)} trade items")
-        
-        for i, trade_data in enumerate(trade_list):
-            try:
-                logger.info(f"Processing trade item {i+1}: {trade_data}")
-                
-                # Extract trade information from received data
-                trade_info = {
-                    'REF': str(trade_data.get('REF', '')),
-                    'Trade_Type': str(trade_data.get('Trade_Type', '')),
-                    'Bought_Lot': float(trade_data.get('Bought_Lot', 0.0)),
-                    'Sold_Lot': float(trade_data.get('Sold_Lot', 0.0)),
-                    'Symbol': str(trade_data.get('Symbol', '')),
-                    'Timestamp': str(trade_data.get('Timestamp', ''))
-                }
-                
-                logger.info(f"Parsed trade info: {trade_info}")
-                
-                # Validate required fields
-                if trade_info['REF'] and trade_info['Trade_Type']:
-                    trades.append(trade_info)
-                    logger.info(f"Valid trade added: REF={trade_info['REF']}")
-                else:
-                    warning_msg = f"Incomplete trade data for item {i+1}: missing REF or Trade_Type"
-                    logger.warning(warning_msg)
-                    error_messages.append(warning_msg)
-                    
-            except (ValueError, KeyError, TypeError) as e:
-                error_msg = f"Error processing trade data item {i+1}: {str(e)}"
-                logger.warning(error_msg)
-                error_messages.append(error_msg)
-                continue
-    
-    except Exception as e:
-        error_msg = f"Error processing trade list: {str(e)}"
-        logger.warning(error_msg)
-        error_messages.append(error_msg)
+    # Process trades using connection pool
+    trades = process_trades_with_pool(data, executor)
     
     # Update global trade data with thread safety
     try:
-        logger.info(f"Updating global trade data with {len(trades)} trades")
         with data_lock:
             received_trade_data = trades
-        
-        trade_update_event.set()  # Signal that new data is available
-        logger.info(f"Successfully received {len(trades)} trades via POST request")
-        for trade in trades:
-            logger.info(f"  REF: {trade['REF']}, Type: {trade['Trade_Type']}, Symbol: {trade['Symbol']}")
-        
+        trade_update_event.set()
     except Exception as e:
-        error_msg = f"Error updating trade data: {str(e)}"
-        logger.warning(error_msg)
-        error_messages.append(error_msg)
-    
-    # Prepare response - ALWAYS 200 status
-    if len(trades) > 0:
-        message = f"Successfully received {len(trades)} trades"
-        if error_messages:
-            message += f" (with {len(error_messages)} warnings)"
-    elif len(error_messages) > 0:
-        message = f"Request processed with {len(error_messages)} issues - no valid trades found"
-    else:
-        message = "Request processed - no trades to execute (close all trades mode)"
+        logger.error(f"Error updating trade data: {e}")
     
     response_data = {
-        "status": "success",  # Always success
-        "message": message,
+        "status": "success",
+        "message": f"Processed {len(trades)} trades",
         "trades_count": len(trades),
         "warnings": error_messages if error_messages else None
     }
     
-    logger.info(f"Sending response (200): {response_data}")
-    
-    # ALWAYS return 200 status code
     return jsonify(response_data), 200
+
+def process_trades_with_pool(data, executor):
+    """Process trades using connection pool"""
+    trades = []
+    futures = []
+    
+    try:
+        trade_list = [data] if not isinstance(data, list) else data
+        
+        # Submit trade processing to thread pool
+        for trade_data in trade_list:
+            futures.append(executor.submit(process_single_trade, trade_data))
+        
+        # Collect results
+        for future in futures:
+            try:
+                result = future.result(timeout=POOL_TIMEOUT)
+                if result:
+                    trades.append(result)
+            except Exception as e:
+                logger.error(f"Error processing trade: {e}")
+    except Exception as e:
+        logger.error(f"Error in trade pool processing: {e}")
+    
+    return trades
+
+def process_single_trade(trade_data):
+    """Process a single trade with connection pooling"""
+    try:
+        if not trade_data:
+            return None
+            
+        trade_info = {
+            'REF': str(trade_data.get('REF', '')),
+            'Trade_Type': str(trade_data.get('Trade_Type', '')),
+            'Bought_Lot': float(trade_data.get('Bought_Lot', 0.0)),
+            'Sold_Lot': float(trade_data.get('Sold_Lot', 0.0)),
+            'Symbol': str(trade_data.get('Symbol', '')),
+            'Timestamp': str(trade_data.get('Timestamp', ''))
+        }
+        
+        if trade_info['REF'] and trade_info['Trade_Type']:
+            return trade_info
+    except Exception as e:
+        logger.error(f"Error processing single trade: {e}")
+    return None
 
 def parse_text_data(text_data):
     """Parse plain text data into trade format - handles URL-encoded form data and JSON"""
@@ -946,31 +933,42 @@ def parse_csv_text_data(text_data):
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    """Get current system status - ALWAYS returns 200"""
+    """Get current system status with connection pooling"""
     logger.info("Received GET request to /status")
     
     try:
-        global received_trade_data
+        # Get executor from context
+        executor = getattr(g, 'executor', None)
+        if not executor:
+            executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            g.executor = executor
         
-        with data_lock:
-            trade_count = len(received_trade_data)
+        # Get trade count using thread pool
+        def get_trade_count():
+            with data_lock:
+                return len(received_trade_data)
+        
+        future = executor.submit(get_trade_count)
+        trade_count = future.result(timeout=POOL_TIMEOUT)
         
         status_data = {
             "status": "running",
             "trades_count": trade_count,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "pool_info": {
+                "active_workers": len(executor._threads),
+                "max_workers": executor._max_workers
+            }
         }
         
-        logger.info(f"Status response: {status_data}")
         return jsonify(status_data), 200
         
     except Exception as e:
         error_msg = f"Error getting status: {str(e)}"
         logger.warning(error_msg)
         
-        # Even if there's an error, return 200 with error info
         error_status = {
-            "status": "error", 
+            "status": "error",
             "message": error_msg,
             "trades_count": 0,
             "timestamp": datetime.now().isoformat()
@@ -979,54 +977,64 @@ def get_status():
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Simple health check endpoint"""
-    return jsonify({"status": "healthy", "timestamp": datetime.now().isoformat()}), 200
+    """Health check endpoint with connection pooling"""
+    try:
+        # Get executor from context
+        executor = getattr(g, 'executor', None)
+        if not executor:
+            executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+            g.executor = executor
+        
+        # Check pool health
+        pool_status = "healthy" if len(executor._threads) < executor._max_workers else "at_capacity"
+        
+        return jsonify({
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat(),
+            "pool_status": pool_status,
+            "active_workers": len(executor._threads),
+            "max_workers": executor._max_workers
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e),
+            "timestamp": datetime.now().isoformat()
+        }), 200
 
 def start_flask_server():
-    """Start Flask server with proper socket handling"""
-    logger.info(f"Starting Flask server on {HOST}:{PORT}...")
+    """Start Flask server in a separate thread"""
+    logger.info(f"Starting Flask server on localhost:{PORT}...")
     try:
-        # Ensure socket is bound
-        if not socket_manager.bind_socket():
-            logger.error("Could not bind socket")
+        # Ensure port is available
+        if not ensure_port_available():
+            logger.error("Could not secure port 3000")
             sys.exit(1)
-        
+            
         # Start port monitor
         port_monitor = PortMonitor()
         port_monitor.start()
         
-        # Configure Flask to use our socket settings
-        app.config['HOST'] = HOST
-        app.config['PORT'] = PORT
-        app.config['THREADED'] = True  # Enable threaded mode
-        
-        # Run Flask with our socket configuration
-        app.run(
-            host=HOST,
-            port=PORT,
-            debug=False,
-            use_reloader=False,
-            threaded=True
-        )
+        # Enable threaded mode for better concurrent handling
+        app.run(host='localhost', port=PORT, debug=False, use_reloader=False, threaded=True)
     except Exception as e:
         logger.error(f"Error starting Flask server: {e}")
         logger.exception("Full traceback:")
 
 class MT5TradeManager:
     def __init__(self, lot_percentage):
-        self.active_trades = {}
-        self.active_trades_lock = Lock()  # Add lock for active trades
-        self.manually_closed_refs = set()
-        self.manually_closed_lock = Lock()  # Add lock for manually closed refs
+        self.active_trades = {}  # Dictionary to store active trades by REF
+        self.manually_closed_refs = set()  # Track REFs that were manually closed
+        self.monitoring = True
         self._lot_percentage = lot_percentage
         self.mt5_connected = False
         self.last_data_check = datetime.now()
-        self.trade_status = {}
-        self.trade_status_lock = Lock()  # Add lock for trade status
-        self.retry_counts = {}
+        self.trade_status = {}  # Track status of each trade
+        self.retry_counts = {}  # Track retry attempts for each trade
         self.last_market_check = 0
         self.market_is_open = False
-        self._lot_lock = threading.Lock()
+        self._lot_lock = threading.Lock()  # Lock for thread-safe lot updates
         
     @property
     def lot_percentage(self):
@@ -1255,32 +1263,31 @@ class MT5TradeManager:
             return False
     
     def check_for_manually_closed_trades(self):
-        """Thread-safe check for manually closed trades"""
+        """Check if any active trades were manually closed in MT5"""
         if not self.active_trades:
             return
-            
+        
         try:
+            # Get all current positions
             positions = mt5.positions_get()
             current_magics = set()
             
             if positions:
                 current_magics = {pos.magic for pos in positions}
             
+            # Check which active trades no longer have positions
             manually_closed = []
-            with self.active_trades_lock:  # Use lock when accessing active_trades
-                for ref, trade_info in list(self.active_trades.items()):
-                    magic = int(ref)
-                    if magic not in current_magics:
-                        manually_closed.append(ref)
+            for ref, trade_info in list(self.active_trades.items()):
+                magic = int(ref)
+                if magic not in current_magics:
+                    manually_closed.append(ref)
             
             # Handle manually closed trades
             for ref in manually_closed:
-                with self.manually_closed_lock:  # Use lock when modifying manually_closed_refs
-                    self.manually_closed_refs.add(ref)
-                with self.active_trades_lock:  # Use lock when modifying active_trades
-                    if ref in self.active_trades:
-                        del self.active_trades[ref]
-                        
+                logger.warning(f"Trade REF {ref} was manually closed in MT5 - removing from active trades")
+                self.manually_closed_refs.add(ref)
+                del self.active_trades[ref]
+                
         except Exception as e:
             logger.error(f"Error checking for manually closed trades: {e}")
     
@@ -1688,37 +1695,125 @@ def start_memory_monitor():
     return monitor
 
 def continuous_monitor_and_execute(trade_manager, check_interval=1):
-    """Thread-safe continuous monitoring"""
-    known_refs = set()
-    known_refs_lock = Lock()  # Local lock for known_refs
+    """Continuously monitor received trade data and handle new/disappeared trades - IMPROVED RELIABILITY"""
+    logger.info(f"Starting reliable monitoring of received POST data (100ms intervals)")
+    logger.info("SYSTEM WILL RUN INDEFINITELY - Monitor logs for activity")
+    logger.info(f"ALL TRADES WILL BE EXECUTED ON BITCOIN ({TRADING_SYMBOL})")
+    logger.info("RELIABLE EXECUTION MODE - Optimized for stability")
+    logger.info("SYSTEM WILL CONTINUE MONITORING EVEN WHEN MARKET IS CLOSED")
+    logger.info("DUPLICATE TRADE PREVENTION AND MANUAL CLOSE DETECTION ENABLED")
+    logger.info("WAITING FOR POST DATA ON http://localhost:{PORT}/trades")
     
-    while not shutdown_event.is_set():  # Check for shutdown
+    known_refs = set()  # Track REFs we've already processed
+    market_closed_warning_shown = False
+    last_status_time = 0
+    last_manual_check = 0
+    initial_sync_done = False  # Flag to track initial sync
+    
+    # Start memory monitoring
+    memory_monitor = start_memory_monitor()
+    
+    # Start UiRobot monitoring (now without command line args)
+    uirobot_monitor = UiRobotMonitor()
+    uirobot_thread = threading.Thread(target=uirobot_monitor.monitor_uirobot, daemon=True)
+    uirobot_thread.start()
+    
+    logger.info("UiRobot monitoring started - will capture command line after 2 minutes")
+    
+    while True:  # Infinite loop - never stops
         try:
+            # Update last check time
+            trade_manager.last_data_check = datetime.now()
+            
+            # Check for manually closed trades every 5 seconds
+            current_time = int(time.time())
+            if current_time - last_manual_check >= 5:
+                trade_manager.check_for_manually_closed_trades()
+                last_manual_check = current_time
+            
             # Get current REFs from received data
-            with trade_data_lock:  # Use lock when accessing received_trade_data
-                current_trades = get_current_trade_data()
+            current_trades = get_current_trade_data()
             current_refs = {trade['REF'] for trade in current_trades}
             
-            # Thread-safe comparison of refs
-            with known_refs_lock:
-                new_refs = current_refs - known_refs
+            # Special handling for first data receipt after startup
+            if not initial_sync_done and current_trades:
+                logger.info("First data received after startup - syncing with existing positions")
+                known_refs = set(trade_manager.active_trades.keys())
+                initial_sync_done = True
+                logger.info(f"Initial sync complete - tracking {len(known_refs)} existing positions")
             
+            # Find new trades (REFs that weren't there before)
+            new_refs = current_refs - known_refs
             if new_refs:
-                # Process new trades
+                logger.info(f"NEW TRADES RECEIVED: {len(new_refs)} new trades: {list(new_refs)}")
+                
+                # Check if market is open before attempting trades
+                tick = mt5.symbol_info_tick(TRADING_SYMBOL)
+                if tick is None:
+                    if not market_closed_warning_shown:
+                        logger.warning(f"BITCOIN market appears to be closed - New trades will be queued until market opens")
+                        market_closed_warning_shown = True
+                else:
+                    market_closed_warning_shown = False  # Reset warning when market is accessible
+                
+                # Execute new trades on Bitcoin INSTANTLY
                 for trade in current_trades:
                     if trade['REF'] in new_refs:
-                        with trade_manager.active_trades_lock:
-                            if trade['REF'] not in trade_manager.active_trades:
-                                result = trade_manager.execute_trade_with_retry(trade)
+                        # Double check this isn't an existing position
+                        if trade['REF'] not in trade_manager.active_trades:
+                            logger.info(f"Processing {trade['REF']} on BITCOIN (original symbol: {trade['Symbol']})")
+                            result = trade_manager.execute_trade_with_retry(trade)
+                            if result is None and tick is None:
+                                logger.info(f"Trade {trade['REF']} queued - will execute when market opens")
+                        else:
+                            logger.info(f"Trade {trade['REF']} already exists in MT5, skipping execution")
             
-            # Update known refs safely
-            with known_refs_lock:
-                known_refs = current_refs.copy()
+            # Check which active trades are no longer in the received data
+            active_refs = set(trade_manager.active_trades.keys())
+            disappeared_refs = active_refs - current_refs
             
-            time.sleep(0.1)  # Prevent CPU overload
+            # Only process disappeared trades after initial sync
+            if initial_sync_done:
+                # Close trades for disappeared REFs INSTANTLY
+                for ref in disappeared_refs:
+                    logger.info(f"REF {ref} no longer in received data - closing Bitcoin trade...")
+                    success = trade_manager.close_trade_with_retry(ref)
+                    if not success:
+                        logger.warning(f"Could not close trade {ref} - may have been closed manually or market is closed")
+            
+            # Update known REFs
+            known_refs = current_refs.copy()
+            
+            # Log comprehensive status every 60 seconds
+            if current_time - last_status_time >= 60:
+                # Check market status
+                tick = mt5.symbol_info_tick(TRADING_SYMBOL)
+                market_status = "OPEN" if tick is not None else "CLOSED"
+                
+                logger.info(f"=== SYSTEM STATUS ===")
+                logger.info(f"Active Bitcoin trades: {len(trade_manager.active_trades)}")
+                logger.info(f"REFs in received data: {len(current_refs)}")
+                logger.info(f"Manually closed REFs: {len(trade_manager.manually_closed_refs)}")
+                logger.info(f"Market status: {market_status}")
+                logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
+                logger.info(f"Flask server: http://localhost:{PORT}")
+                logger.info(f"UiRobot status: {'RUNNING' if uirobot_monitor.is_uirobot_running() else 'NOT RUNNING'}")
+                logger.info(f"===================")
+                last_status_time = current_time
+            
+            # Ultra-tiny sleep to prevent 100% CPU usage while maintaining ultra-fast response
+            time.sleep(0.1)  # 100ms - more reasonable for MT5 processing and system stability
+            
+        except KeyboardInterrupt:
+            # Even if user tries to interrupt, continue running
+            logger.warning("Interrupt detected but system will CONTINUE RUNNING")
+            time.sleep(0.0001)  # Ultra-tiny delay to prevent CPU overload
+            continue
             
         except Exception as e:
             logger.error(f"Error in monitoring loop: {e}")
+            logger.info("Continuing monitoring after error...")
+            time.sleep(0.0001)  # Ultra-tiny delay to prevent CPU overload
             continue
 
 def display_trades(trades):
@@ -1747,64 +1842,151 @@ def display_trades(trades):
     print(f"Note: All trades above will be executed on BITCOIN ({TRADING_SYMBOL}) regardless of original symbol")
 
 def cleanup_files():
-    """Thread-safe cleanup"""
-    with cleanup_lock:  # Use lock during cleanup
-        try:
-            files_to_cleanup = [LOCK_FILE, PORT_LOCK_FILE, CMDLINE_FILE]
-            for file in files_to_cleanup:
-                if os.path.exists(file):
-                    os.remove(file)
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+    """Cleanup all lock and state files on exit"""
+    try:
+        files_to_cleanup = [LOCK_FILE, PORT_LOCK_FILE, CMDLINE_FILE]
+        for file in files_to_cleanup:
+            if os.path.exists(file):
+                os.remove(file)
+    except:
+        pass
 
 def main():
-    """Main function with proper thread shutdown"""
-    try:
-        # Register cleanup
-        atexit.register(cleanup_files)
+    """Main execution function - NEVER STOPS - ULTRA-FAST (0.1ms)"""
+    # Register cleanup for all files
+    atexit.register(cleanup_files)
+    
+    # Ensure single instance
+    if not ensure_single_instance():
+        sys.exit(1)
         
-        # Start threads
-        threads = []
+    # Ensure port 3000 is available
+    if not ensure_port_available():
+        logger.error("Could not secure port 3000")
+        sys.exit(1)
         
-        # Flask thread
-        flask_thread = threading.Thread(target=start_flask_server, daemon=True)
-        flask_thread.start()
-        threads.append(flask_thread)
-        
-        # Memory monitor thread
-        memory_monitor = start_memory_monitor()
-        
-        # UiRobot monitor thread
-        uirobot_monitor = UiRobotMonitor()
-        uirobot_thread = threading.Thread(target=uirobot_monitor.monitor_uirobot, daemon=True)
-        uirobot_thread.start()
-        threads.append(uirobot_thread)
-        
-        # Port monitor thread
-        port_monitor = PortMonitor()
-        port_monitor.start()
-        threads.append(port_monitor)
-        
+    print("\n" + "="*70)
+    print("=== MT5 CONTINUOUS BITCOIN TRADING SYSTEM (Flask POST) ===")
+    print("="*70)
+    
+    # Parse arguments first
+    args = parse_arguments()
+    
+    logger.info("=== MT5 CONTINUOUS BITCOIN TRADING SYSTEM (Flask POST) ===")
+    logger.info("THIS SYSTEM RUNS INDEFINITELY")
+    logger.info(f"ALL TRADES WILL BE EXECUTED ON BITCOIN ({TRADING_SYMBOL})")
+    logger.info("ULTRA-FAST EXECUTION MODE - 0.1ms INTERVALS")
+    logger.info(f"LISTENING FOR POST DATA ON http://localhost:{PORT}/trades")
+    logger.info(f"LOT PERCENTAGE: {args.lot_percentage}% (configured via C# GUI)")
+
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
+    flask_thread.start()
+    logger.info("Flask server started on http://localhost:{PORT}")
+    
+    # Wait a moment for Flask to start
+    time.sleep(2)
+    
+    # Outer infinite loop for system restart
+    while True:
         try:
-            # Main loop
-            while True:
-                if shutdown_event.is_set():
-                    break
-                time.sleep(0.1)
-        except KeyboardInterrupt:
-            logger.info("Shutting down gracefully...")
-            shutdown_event.set()  # Signal threads to stop
+            # Initialize MT5 Trade Manager with lot percentage from command line
+            trade_manager = MT5TradeManager(args.lot_percentage / 100.0)
             
-            # Wait for threads to finish
-            for thread in threads:
-                if thread.is_alive():
-                    thread.join(timeout=5)
+            print(f"\nLOT SIZE CONFIGURATION: {args.lot_percentage}% (from C# GUI)")
+            print("=" * 50)
+            logger.info(f"Using {args.lot_percentage}% lot execution (configured via C# GUI)")
+            break  # Exit the configuration loop
             
-    except Exception as e:
-        logger.error(f"Fatal error in main: {e}")
-        shutdown_event.set()
-    finally:
-        cleanup_files()
+        except Exception as e:
+            logger.error(f"Error in configuration: {e}")
+            print("Error occurred, using default 100%")
+            trade_manager = MT5TradeManager(1.0)
+            break
+    
+    # Now start the main system loop
+    while True:  # System restart loop
+        try:
+            print("\n" + "="*50)
+            print("INITIALIZING MT5 CONNECTION...")
+            print("="*50)
+            
+            # Initialize MT5 - keep trying until successful
+            while not trade_manager.initialize_mt5():
+                logger.error("Failed to initialize MT5, retrying instantly...")
+                time.sleep(0.1)  # 100ms delay for MT5 connection issues only
+            
+            # IMPORTANT: Sync existing MT5 positions first
+            trade_manager.sync_existing_mt5_positions()
+            
+            # List any existing positions for debugging
+            trade_manager.list_all_existing_positions()
+            
+            # Check if there's any initial data
+            initial_trades = get_current_trade_data()
+            
+            if initial_trades:
+                # Display found trades
+                display_trades(initial_trades)
+                
+                # Ask user confirmation for initial execution
+                try:
+                    print(f"\nFound {len(initial_trades)} initial trades to execute ON BITCOIN.")
+                    confirm = input("Execute initial trades on BITCOIN? (y/n, default y): ")
+                    
+                    if not confirm.strip() or confirm.lower() == 'y':
+                        logger.info("=== EXECUTING INITIAL TRADES ON BITCOIN ===")
+                        executed_count = 0
+                        skipped_count = 0
+                        
+                        for i, trade in enumerate(initial_trades, 1):
+                            # Skip if we already have this trade from MT5 sync
+                            if trade['REF'] in trade_manager.active_trades:
+                                logger.info(f"Trade {trade['REF']} already exists in MT5, skipping")
+                                skipped_count += 1
+                                continue
+                                
+                            logger.info(f"--- Processing trade {i}/{len(initial_trades)}: REF {trade['REF']} ---")
+                            result = trade_manager.execute_trade_with_retry(trade)
+                            if result:
+                                executed_count += 1
+                                logger.info(f"✅ Trade {i}: REF {trade['REF']} EXECUTED successfully")
+                            else:
+                                skipped_count += 1
+                                logger.warning(f"❌ Trade {i}: REF {trade['REF']} SKIPPED or FAILED")
+                            # ULTRA-FAST - NO DELAY between initial trades
+                        
+                        logger.info(f"=== INITIAL TRADE SUMMARY ===")
+                        logger.info(f"Total trades found: {len(initial_trades)}")
+                        logger.info(f"Successfully executed: {executed_count}")
+                        logger.info(f"Skipped/Failed: {skipped_count}")
+                        logger.info(f"============================")
+                    else:
+                        logger.info("Initial Bitcoin trade execution skipped")
+                        
+                except KeyboardInterrupt:
+                    logger.info("Using default settings and continuing...")
+            else:
+                logger.info("No initial trades found")
+                logger.info("System will monitor for POST data on http://localhost:{PORT}/trades")
+            
+            # Start continuous monitoring (NEVER STOPS - ULTRA-FAST)
+            print("\n" + "="*50)
+            print("STARTING ULTRA-FAST MONITORING (0.1ms)...")
+            print("Flask server running on http://localhost:{PORT}")
+            print("POST trade data to: http://localhost:{PORT}/trades")
+            print("Check status at: http://localhost:{PORT}/status")
+            print("="*50)
+            logger.info("Starting ULTRA-FAST BITCOIN monitoring mode (0.1ms intervals)...")
+            logger.info(f"Using {trade_manager.lot_percentage*100}% lot size (configured via C# GUI)")
+            logger.info("Ready to receive POST data on http://localhost:{PORT}/trades")
+            continuous_monitor_and_execute(trade_manager, 1)
+            
+        except Exception as e:
+            logger.error(f"System error occurred: {e}")
+            logger.info("Restarting system instantly...")
+            time.sleep(0.1)  # 100ms delay for system restart only
+            continue
 
 # Add new endpoint for dynamic lot size updates
 @app.route('/update_lot_size', methods=['POST'])
@@ -1876,34 +2058,22 @@ def kill_process_on_port(port):
     return False
 
 def ensure_port_available():
-    """Ensure port is available with proper socket handling"""
+    """Ensure port 3000 is available, killing any process using it"""
     try:
-        # First check if port is in use
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            sock.settimeout(SOCKET_TIMEOUT)
-            result = sock.connect_ex(('127.0.0.1', PORT))
-            
-            if result == 0:  # Port is in use
-                logger.warning(f"Port {PORT} is in use, attempting to free it")
-                if kill_process_on_port(PORT):
-                    time.sleep(1)  # Wait for port to be fully released
-                    
-                    # Double check port is now free
-                    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as check_sock:
-                        check_sock.settimeout(SOCKET_TIMEOUT)
-                        result = check_sock.connect_ex(('127.0.0.1', PORT))
-                        if result == 0:
-                            logger.error(f"Port {PORT} still in use after attempting to free it")
-                            return False
+        # Check if port is in use
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('127.0.0.1', PORT))
+        sock.close()
         
-        # Try to bind the socket
-        if not socket_manager.bind_socket():
-            return False
-        
+        if result == 0:  # Port is in use
+            logger.warning(f"Port {PORT} is in use, attempting to free it")
+            if kill_process_on_port(PORT):
+                time.sleep(1)  # Wait for port to be fully released
+                
         # Create port lock file
         with open(PORT_LOCK_FILE, 'w') as f:
             f.write(str(os.getpid()))
-        
+            
         # Register cleanup
         atexit.register(cleanup_port_lock)
         
@@ -1947,68 +2117,57 @@ class PortMonitor(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.monitoring = True
-        self.socket_check_interval = 1  # Check every second
         
     def run(self):
-        """Monitor port with improved socket handling"""
+        """Monitor port 3000 and ensure we maintain exclusive access"""
         while self.monitoring:
             try:
                 # Check if we still own the port
                 if not check_port_owner():
-                    logger.error("Lost port ownership!")
+                    logger.error("Lost port 3000 ownership!")
                     os.kill(os.getpid(), signal.SIGTERM)
                     return
                 
-                # Check socket binding
-                with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-                    sock.settimeout(SOCKET_TIMEOUT)
-                    result = sock.connect_ex(('127.0.0.1', PORT))
+                # Check if any other process is using our port
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(('127.0.0.1', PORT))
+                sock.close()
+                
+                if result == 0:  # Port is in use
+                    # Check if it's us using the port
+                    our_port = False
+                    for conn in psutil.Process(os.getpid()).connections():
+                        if hasattr(conn, 'laddr') and hasattr(conn.laddr, 'port') and conn.laddr.port == PORT:
+                            our_port = True
+                            break
                     
-                    if result == 0:  # Port is in use
-                        # Check if it's us using the port
-                        our_port = False
-                        for conn in psutil.Process(os.getpid()).connections():
-                            if hasattr(conn, 'laddr') and hasattr(conn.laddr, 'port') and conn.laddr.port == PORT:
-                                our_port = True
-                                break
-                        
-                        if not our_port:
-                            logger.warning(f"Another process is using port {PORT}!")
-                            if kill_process_on_port(PORT):
-                                # Try to rebind our socket
-                                if not socket_manager.bind_socket():
-                                    logger.error("Failed to rebind socket")
-                                    os.kill(os.getpid(), signal.SIGTERM)
-                                    return
+                    if not our_port:
+                        logger.warning("Another process is using port 3000!")
+                        kill_process_on_port(PORT)
                 
             except Exception as e:
                 logger.error(f"Error in port monitor: {e}")
                 
-            time.sleep(self.socket_check_interval)
-    
-    def stop(self):
-        """Stop monitoring and release socket"""
-        self.monitoring = False
-        socket_manager.release_socket()
+            time.sleep(1)  # Check every second
 
-def cleanup_on_exit():
-    """Cleanup function for proper shutdown"""
+def cleanup_server():
+    """Cleanup server resources"""
     try:
-        # Stop port monitor
-        if hasattr(cleanup_on_exit, 'port_monitor'):
-            cleanup_on_exit.port_monitor.stop()
+        # Close all connections in the pool
+        session.close()
         
-        # Release socket
-        socket_manager.release_socket()
-        
-        # Remove lock files
-        cleanup_files()
-        
+        # Close any remaining sockets
+        for sock in socket.socket(socket.AF_INET, socket.SOCK_STREAM):
+            try:
+                sock.close()
+            except:
+                pass
+                
     except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
+        logger.error(f"Error during server cleanup: {e}")
 
-# Register cleanup function
-atexit.register(cleanup_on_exit)
+# Register cleanup
+atexit.register(cleanup_server)
 
 if __name__ == "__main__":
     main() 
