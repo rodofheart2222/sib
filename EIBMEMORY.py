@@ -21,9 +21,12 @@ import subprocess
 import atexit
 import random
 import signal
+import requests  # Add requests for API calls
 
 # Setup advanced logging
 logger = logging.getLogger(__name__)
+
+# Add Xano API constants
 
 # Constants for ultra-reliable execution
 MAX_RETRIES = 5
@@ -224,6 +227,41 @@ def kill_uipath_processes():
         logger.error(f"Error killing UiPath processes: {e}")
         return []
 
+XANO_API_BASE_URL = "https://x8ki-letl-twmt.n7.xano.io/api:M56UdKHz"
+XANO_TRADE_DATA_ENDPOINT = f"{XANO_API_BASE_URL}/trade_data"
+
+# Add dictionary to store Xano trade IDs
+xano_trade_ids = {}  # Maps REF to Xano trade ID
+
+def post_trade_to_xano(action: str, lot_amount: float) -> Optional[int]:
+    """Post trade data to Xano API and return the trade ID"""
+    try:
+        payload = {
+            "action": action,
+            "lot_amount": lot_amount
+        }
+        
+        response = requests.post(XANO_TRADE_DATA_ENDPOINT, json=payload)
+        response.raise_for_status()
+        
+        data = response.json()
+        return data.get('id')
+        
+    except Exception as e:
+        logger.error(f"Error posting trade to Xano: {e}")
+        return None
+
+def delete_trade_from_xano(trade_id: int) -> bool:
+    """Delete trade data from Xano API"""
+    try:
+        delete_url = f"{XANO_TRADE_DATA_ENDPOINT}/{trade_id}"
+        response = requests.delete(delete_url)
+        response.raise_for_status()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error deleting trade from Xano: {e}")
+        return False
 def check_executor_memory():
     """Check if UiPath.Executor.exe memory exceeds 1GB"""
     try:
@@ -1018,6 +1056,17 @@ class MT5TradeManager:
                 result = mt5.order_send(request)
                 
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    # Post to Xano API
+                    xano_trade_id = post_trade_to_xano(
+                        action=trade_type.upper(),
+                        lot_amount=lot_size
+                    )
+                    
+                    if xano_trade_id:
+                        # Store Xano trade ID for later deletion
+                        xano_trade_ids[ref] = xano_trade_id
+                        logger.info(f"Trade {ref} posted to Xano with ID: {xano_trade_id}")
+                    
                     # Success! Record the trade with actual execution details
                     trade_record = {
                         'ref': ref,
@@ -1028,7 +1077,8 @@ class MT5TradeManager:
                         'volume': result.volume,
                         'open_price': result.price,
                         'magic': int(ref),
-                        'execution_time': datetime.now().timestamp()
+                        'execution_time': datetime.now().timestamp(),
+                        'xano_trade_id': xano_trade_id  # Store Xano ID in trade record
                     }
                     
                     self.active_trades[ref] = trade_record
@@ -1050,6 +1100,17 @@ class MT5TradeManager:
                     result = mt5.order_send(request)
                     
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        # Post to Xano API
+                        xano_trade_id = post_trade_to_xano(
+                            action=trade_type.upper(),
+                            lot_amount=lot_size
+                        )
+                        
+                        if xano_trade_id:
+                            # Store Xano trade ID for later deletion
+                            xano_trade_ids[ref] = xano_trade_id
+                            logger.info(f"Trade {ref} posted to Xano with ID: {xano_trade_id}")
+                        
                         # Success with IOC
                         trade_record = {
                             'ref': ref,
@@ -1060,7 +1121,8 @@ class MT5TradeManager:
                             'volume': result.volume,  # Important: Use actual filled volume
                             'open_price': result.price,
                             'magic': int(ref),
-                            'execution_time': datetime.now().timestamp()
+                            'execution_time': datetime.now().timestamp(),
+                            'xano_trade_id': xano_trade_id  # Store Xano ID in trade record
                         }
                         
                         self.active_trades[ref] = trade_record
@@ -1302,6 +1364,14 @@ class MT5TradeManager:
                 if target_position is None:
                     logger.warning(f"Position with REF {ref} not found - may have been manually closed")
                     self.manually_closed_refs.add(ref)
+                    
+                    # Delete from Xano if we have the ID
+                    if ref in xano_trade_ids:
+                        xano_trade_id = xano_trade_ids[ref]
+                        if delete_trade_from_xano(xano_trade_id):
+                            logger.info(f"Deleted trade {ref} from Xano (ID: {xano_trade_id})")
+                            del xano_trade_ids[ref]
+                    
                     del self.active_trades[ref]
                     return False
                 
@@ -1333,6 +1403,13 @@ class MT5TradeManager:
                 result = mt5.order_send(request)
                 
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
+                    # Delete from Xano if we have the ID
+                    if ref in xano_trade_ids:
+                        xano_trade_id = xano_trade_ids[ref]
+                        if delete_trade_from_xano(xano_trade_id):
+                            logger.info(f"Deleted trade {ref} from Xano (ID: {xano_trade_id})")
+                            del xano_trade_ids[ref]
+                    
                     # Success!
                     logger.info(f"Successfully closed trade {ref}")
                     del self.active_trades[ref]
@@ -1351,6 +1428,13 @@ class MT5TradeManager:
                     result = mt5.order_send(request)
                     
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
+                        # Delete from Xano if we have the ID
+                        if ref in xano_trade_ids:
+                            xano_trade_id = xano_trade_ids[ref]
+                            if delete_trade_from_xano(xano_trade_id):
+                                logger.info(f"Deleted trade {ref} from Xano (ID: {xano_trade_id})")
+                                del xano_trade_ids[ref]
+                        
                         # Success with IOC
                         logger.info(f"Successfully closed trade {ref} with IOC")
                         del self.active_trades[ref]
