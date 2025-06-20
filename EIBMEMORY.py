@@ -1,4 +1,4 @@
-import csv
+import cs
 import pandas as pd
 import MetaTrader5 as mt5
 import time
