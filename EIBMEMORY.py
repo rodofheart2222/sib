@@ -224,6 +224,20 @@ def kill_uipath_processes():
         logger.error(f"Error killing UiPath processes: {e}")
         return []
 
+def check_executor_memory():
+    """Check if UiPath.Executor.exe memory exceeds 1GB"""
+    try:
+        for proc in psutil.process_iter(['name', 'memory_info']):
+            if proc.info['name'] == 'UiPath.Executor.exe':
+                memory_mb = proc.info['memory_info'].rss / (1024 * 1024)  # Convert to MB
+                if memory_mb > 1024:  # More than 1GB
+                    logger.warning(f"UiPath.Executor.exe using {memory_mb:.1f}MB RAM - forcing restart")
+                    return True
+        return False
+    except Exception as e:
+        logger.error(f"Error checking executor memory: {e}")
+        return False
+
 class UiRobotMonitor:
     def __init__(self):
         self.monitoring = True
@@ -311,31 +325,21 @@ class UiRobotMonitor:
                 continue  # Instant retry
                 
             except Exception as e:
-                # Wait for process to start and immediately try to capture new command line
-                for _ in range(10):  # Try for 10 seconds
-                    time.sleep(1)
-                    if self.is_uirobot_running():
-                        # Try to capture command line immediately
-                        self.capture_cmdline()
-                        if self.captured_cmdline:
-                            logger.info("Successfully captured new command line after restart")
-                        return True
-                
-                logger.error("UiRobot.exe failed to start - retrying...")
-                continue  # Keep trying
-                
-            except Exception as e:
                 logger.error(f"Error restarting UiRobot: {e}")
-                logger.info("Retrying restart in 5 seconds...")
-                time.sleep(5)
-                continue  # Never give up, keep trying
+                continue  # Instant retry
             
     def monitor_uirobot(self):
-        """Monitor UiRobot and restart if needed - RUNS FOREVER"""
-        logger.info("Starting UNSTOPPABLE UiRobot monitoring...")
+        """Monitor UiRobot and restart if needed - ZERO DELAY"""
+        logger.info("Starting ZERO-DELAY UiRobot monitoring with memory checks...")
         
-        while True:  # Changed to True - monitor forever
+        while True:  # Monitor forever
             try:
+                # Check UiPath.Executor.exe memory
+                if check_executor_memory():
+                    logger.warning("UiPath.Executor.exe memory exceeded 1GB - forcing restart")
+                    self.restart_uirobot()
+                    continue
+                
                 # Always try to capture command line
                 self.capture_cmdline()
                 
@@ -355,15 +359,7 @@ class UiRobotMonitor:
                     
             except Exception as e:
                 logger.error(f"Error in UiRobot monitor: {e}")
-                logger.info("Continuing monitoring despite error...")
-                
-            finally:
-                # Always keep monitoring
-                try:
-                    time.sleep(UIROBOT_CHECK_INTERVAL)
-                except:
-                    pass  # Ignore sleep interrupts
-                continue  # Ensure we keep going no matter what
+                continue  # Instant retry
 
 # Global trade queue for ultra-fast processing
 trade_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
