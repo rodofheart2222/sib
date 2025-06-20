@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 import psutil  # Add at top with other imports
 import subprocess
 import atexit
+import random
+import signal
 
 # Setup advanced logging
 logger = logging.getLogger(__name__)
@@ -37,12 +39,73 @@ MAX_MEMORY_PERCENT = 85  # Maximum memory percentage before action
 MONITORED_PROCESSES = ["UiRobot.exe"]  # List of processes to monitor
 MEMORY_WARNING_THRESHOLD = 75  # Warning threshold percentage
 UIROBOT_CHECK_INTERVAL = 5  # Check UiRobot every 5 seconds
+UIROBOT_INITIAL_WAIT = 120  # Wait 2 minutes before capturing command line
+
+# Port configuration
+PORT = 3000  # We will only use port 3000
+PORT_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'port_3000.lock')
 
 # Single instance lock file
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eibmemory.lock')
+PORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eibmemory.port')
 
-# Store original command line arguments
-ORIGINAL_ARGS = sys.argv[1:]
+def find_free_port():
+    """Find a free port in the range 3000-3999"""
+    try:
+        # First try the default port
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('127.0.0.1', PORT))
+        sock.close()
+        
+        if result != 0:  # Port is free
+            return PORT
+            
+        # Try random ports in range if default is taken
+        used_ports = set()
+        while len(used_ports) < (PORT_RANGE_END - PORT_RANGE_START):
+            port = random.randint(PORT_RANGE_START, PORT_RANGE_END)
+            if port in used_ports:
+                continue
+                
+            used_ports.add(port)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', port))
+            sock.close()
+            
+            if result != 0:  # Port is free
+                return port
+                
+        raise Exception("No free ports found in range")
+        
+    except Exception as e:
+        logger.error(f"Error finding free port: {e}")
+        return None
+
+def save_port_number(port):
+    """Save the current port number to file"""
+    try:
+        with open(PORT_FILE, 'w') as f:
+            f.write(str(port))
+    except Exception as e:
+        logger.error(f"Error saving port number: {e}")
+
+def get_saved_port():
+    """Get the saved port number"""
+    try:
+        if os.path.exists(PORT_FILE):
+            with open(PORT_FILE, 'r') as f:
+                return int(f.read().strip())
+    except:
+        pass
+    return None
+
+def cleanup_port_file():
+    """Remove port file on exit"""
+    try:
+        if os.path.exists(PORT_FILE):
+            os.remove(PORT_FILE)
+    except:
+        pass
 
 def ensure_single_instance():
     """Ensure only one instance of the script runs at a time"""
@@ -82,50 +145,39 @@ def cleanup_lock_file():
     except:
         pass
 
-def restart_uirobot(command_line_args):
-    """Restart UiRobot.exe with same command line arguments"""
+def get_uirobot_cmdline():
+    """Get UiRobot.exe command line arguments"""
     try:
-        # Find UiRobot.exe path - assuming it's in a standard location
-        uirobot_paths = [
-            r"C:\Program Files\UiPath\Studio\UiRobot.exe",
-            r"C:\Program Files (x86)\UiPath\Studio\UiRobot.exe"
-        ]
-        
-        uirobot_path = None
-        for path in uirobot_paths:
-            if os.path.exists(path):
-                uirobot_path = path
-                break
-                
-        if not uirobot_path:
-            logger.error("UiRobot.exe not found in standard locations")
-            return False
-            
-        # Kill any existing UiRobot processes
-        for proc in psutil.process_iter(['name']):
+        for proc in psutil.process_iter(['name', 'cmdline']):
             if proc.info['name'] == 'UiRobot.exe':
-                try:
-                    proc.kill()
-                    proc.wait(timeout=5)
-                except:
-                    pass
-                    
-        # Start new UiRobot process
-        subprocess.Popen([uirobot_path] + command_line_args)
-        logger.info(f"Started UiRobot.exe with args: {command_line_args}")
-        return True
-        
+                cmdline = proc.info['cmdline']
+                if cmdline and len(cmdline) > 1:
+                    # Process command line to ensure port 3000
+                    new_args = []
+                    for arg in cmdline[1:]:
+                        # Replace any port number with 3000
+                        if 'localhost:' in arg or '127.0.0.1:' in arg:
+                            parts = arg.split(':')
+                            if len(parts) > 1:
+                                # Always use port 3000
+                                parts[-1] = str(PORT)
+                                arg = ':'.join(parts)
+                        new_args.append(arg)
+                    return new_args
+        return []
     except Exception as e:
-        logger.error(f"Error restarting UiRobot: {e}")
-        return False
+        logger.error(f"Error getting UiRobot command line: {e}")
+        return []
 
 class UiRobotMonitor:
-    def __init__(self, command_line_args):
-        self.command_line_args = command_line_args
+    def __init__(self):
         self.monitoring = True
         self.last_restart = 0
         self.restart_count = 0
         self.max_restarts = 5  # Maximum restarts per hour
+        self.captured_cmdline = None
+        self.initial_wait_complete = False
+        self.start_time = time.time()
         
     def is_uirobot_running(self):
         """Check if UiRobot is running"""
@@ -134,19 +186,82 @@ class UiRobotMonitor:
                 return True
         return False
         
+    def capture_cmdline(self):
+        """Capture UiRobot command line after initial wait"""
+        if not self.initial_wait_complete:
+            elapsed = time.time() - self.start_time
+            if elapsed >= UIROBOT_INITIAL_WAIT:
+                logger.info("Initial 2-minute wait complete - capturing UiRobot command line")
+                self.captured_cmdline = get_uirobot_cmdline()
+                if self.captured_cmdline:
+                    logger.info(f"Captured UiRobot arguments: {self.captured_cmdline}")
+                else:
+                    logger.warning("No command line arguments found for UiRobot")
+                self.initial_wait_complete = True
+                
+    def restart_uirobot(self):
+        """Restart UiRobot.exe with captured command line"""
+        try:
+            # Find UiRobot.exe path
+            uirobot_paths = [
+                r"C:\Program Files\UiPath\Studio\UiRobot.exe",
+                r"C:\Program Files (x86)\UiPath\Studio\UiRobot.exe"
+            ]
+            
+            uirobot_path = None
+            for path in uirobot_paths:
+                if os.path.exists(path):
+                    uirobot_path = path
+                    break
+                    
+            if not uirobot_path:
+                logger.error("UiRobot.exe not found in standard locations")
+                return False
+                
+            # Kill any existing UiRobot processes
+            for proc in psutil.process_iter(['name']):
+                if proc.info['name'] == 'UiRobot.exe':
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    except:
+                        pass
+                        
+            # Use captured command line if available, otherwise use empty list
+            cmdline = self.captured_cmdline if self.captured_cmdline else []
+            
+            # Start new UiRobot process
+            subprocess.Popen([uirobot_path] + cmdline)
+            logger.info(f"Started UiRobot.exe with args: {cmdline}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error restarting UiRobot: {e}")
+            return False
+            
     def monitor_uirobot(self):
         """Monitor UiRobot and restart if needed"""
         while self.monitoring:
             try:
+                # First, try to capture command line if not done yet
+                self.capture_cmdline()
+                
                 if not self.is_uirobot_running():
                     current_time = time.time()
+                    
+                    # Only attempt restart after initial wait
+                    if not self.initial_wait_complete:
+                        logger.info("Waiting for initial 2-minute period before monitoring UiRobot")
+                        time.sleep(UIROBOT_CHECK_INTERVAL)
+                        continue
+                    
                     # Reset restart count if more than an hour has passed
                     if current_time - self.last_restart > 3600:
                         self.restart_count = 0
                         
                     if self.restart_count < self.max_restarts:
                         logger.warning("UiRobot.exe not running - attempting restart")
-                        if restart_uirobot(self.command_line_args):
+                        if self.restart_uirobot():
                             self.last_restart = current_time
                             self.restart_count += 1
                             logger.info(f"UiRobot.exe restarted (attempt {self.restart_count})")
@@ -677,10 +792,19 @@ def health_check():
 
 def start_flask_server():
     """Start Flask server in a separate thread"""
-    logger.info("Starting Flask server on localhost:3000...")
+    logger.info(f"Starting Flask server on localhost:{PORT}...")
     try:
+        # Ensure port is available
+        if not ensure_port_available():
+            logger.error("Could not secure port 3000")
+            sys.exit(1)
+            
+        # Start port monitor
+        port_monitor = PortMonitor()
+        port_monitor.start()
+        
         # Enable threaded mode for better concurrent handling
-        app.run(host='localhost', port=3000, debug=False, use_reloader=False, threaded=True)
+        app.run(host='localhost', port=PORT, debug=False, use_reloader=False, threaded=True)
     except Exception as e:
         logger.error(f"Error starting Flask server: {e}")
         logger.exception("Full traceback:")
@@ -1319,7 +1443,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     logger.info("RELIABLE EXECUTION MODE - Optimized for stability")
     logger.info("SYSTEM WILL CONTINUE MONITORING EVEN WHEN MARKET IS CLOSED")
     logger.info("DUPLICATE TRADE PREVENTION AND MANUAL CLOSE DETECTION ENABLED")
-    logger.info("WAITING FOR POST DATA ON http://localhost:3000/trades")
+    logger.info("WAITING FOR POST DATA ON http://localhost:{PORT}/trades")
     
     known_refs = set()  # Track REFs we've already processed
     market_closed_warning_shown = False
@@ -1330,10 +1454,12 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     # Start memory monitoring
     memory_monitor = start_memory_monitor()
     
-    # Start UiRobot monitoring
-    uirobot_monitor = UiRobotMonitor(ORIGINAL_ARGS)
+    # Start UiRobot monitoring (now without command line args)
+    uirobot_monitor = UiRobotMonitor()
     uirobot_thread = threading.Thread(target=uirobot_monitor.monitor_uirobot, daemon=True)
     uirobot_thread.start()
+    
+    logger.info("UiRobot monitoring started - will capture command line after 2 minutes")
     
     while True:  # Infinite loop - never stops
         try:
@@ -1411,7 +1537,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 logger.info(f"Manually closed REFs: {len(trade_manager.manually_closed_refs)}")
                 logger.info(f"Market status: {market_status}")
                 logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
-                logger.info(f"Flask server: http://localhost:3000")
+                logger.info(f"Flask server: http://localhost:{PORT}")
                 logger.info(f"UiRobot status: {'RUNNING' if uirobot_monitor.is_uirobot_running() else 'NOT RUNNING'}")
                 logger.info(f"===================")
                 last_status_time = current_time
@@ -1462,6 +1588,11 @@ def main():
     if not ensure_single_instance():
         sys.exit(1)
         
+    # Ensure port 3000 is available
+    if not ensure_port_available():
+        logger.error("Could not secure port 3000")
+        sys.exit(1)
+        
     print("\n" + "="*70)
     print("=== MT5 CONTINUOUS BITCOIN TRADING SYSTEM (Flask POST) ===")
     print("="*70)
@@ -1473,13 +1604,13 @@ def main():
     logger.info("THIS SYSTEM RUNS INDEFINITELY")
     logger.info(f"ALL TRADES WILL BE EXECUTED ON BITCOIN ({TRADING_SYMBOL})")
     logger.info("ULTRA-FAST EXECUTION MODE - 0.1ms INTERVALS")
-    logger.info("LISTENING FOR POST DATA ON http://localhost:3000/trades")
+    logger.info(f"LISTENING FOR POST DATA ON http://localhost:{PORT}/trades")
     logger.info(f"LOT PERCENTAGE: {args.lot_percentage}% (configured via C# GUI)")
-    
+
     # Start Flask server in a separate thread
     flask_thread = threading.Thread(target=start_flask_server, daemon=True)
     flask_thread.start()
-    logger.info("Flask server started on http://localhost:3000")
+    logger.info("Flask server started on http://localhost:{PORT}")
     
     # Wait a moment for Flask to start
     time.sleep(2)
@@ -1565,18 +1696,18 @@ def main():
                     logger.info("Using default settings and continuing...")
             else:
                 logger.info("No initial trades found")
-                logger.info("System will monitor for POST data on http://localhost:3000/trades")
+                logger.info("System will monitor for POST data on http://localhost:{PORT}/trades")
             
             # Start continuous monitoring (NEVER STOPS - ULTRA-FAST)
             print("\n" + "="*50)
             print("STARTING ULTRA-FAST MONITORING (0.1ms)...")
-            print("Flask server running on http://localhost:3000")
-            print("POST trade data to: http://localhost:3000/trades")
-            print("Check status at: http://localhost:3000/status")
+            print("Flask server running on http://localhost:{PORT}")
+            print("POST trade data to: http://localhost:{PORT}/trades")
+            print("Check status at: http://localhost:{PORT}/status")
             print("="*50)
             logger.info("Starting ULTRA-FAST BITCOIN monitoring mode (0.1ms intervals)...")
             logger.info(f"Using {trade_manager.lot_percentage*100}% lot size (configured via C# GUI)")
-            logger.info("Ready to receive POST data on http://localhost:3000/trades")
+            logger.info("Ready to receive POST data on http://localhost:{PORT}/trades")
             continuous_monitor_and_execute(trade_manager, 1)
             
         except Exception as e:
@@ -1633,6 +1764,65 @@ def get_trade_manager():
         args = parse_arguments()
         _trade_manager = MT5TradeManager(args.lot_percentage / 100.0)
     return _trade_manager
+
+class PortMonitor(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.monitoring = True
+        
+    def run(self):
+        """Monitor port 3000 and ensure we maintain exclusive access"""
+        while self.monitoring:
+            try:
+                # Check if we still own the port
+                if not check_port_owner():
+                    logger.error("Lost port 3000 ownership!")
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+                
+                # Check if any other process is using our port
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                result = sock.connect_ex(('127.0.0.1', PORT))
+                sock.close()
+                
+                if result == 0:  # Port is in use
+                    # Check if it's us using the port
+                    our_port = False
+                    for conn in psutil.Process(os.getpid()).connections():
+                        if conn.laddr.port == PORT:
+                            our_port = True
+                            break
+                    
+                    if not our_port:
+                        logger.warning("Another process is using port 3000!")
+                        kill_process_on_port(PORT)
+                
+            except Exception as e:
+                logger.error(f"Error in port monitor: {e}")
+                
+            time.sleep(1)  # Check every second
+
+def check_port_owner():
+    """Check if we own the port lock"""
+    try:
+        if os.path.exists(PORT_LOCK_FILE):
+            with open(PORT_LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+                if pid == os.getpid():
+                    return True
+                try:
+                    # Check if process exists
+                    proc = psutil.Process(pid)
+                    if proc.is_running():
+                        logger.error(f"Port 3000 is owned by another process (PID: {pid})")
+                        return False
+                except psutil.NoSuchProcess:
+                    # Process doesn't exist, we can take over
+                    pass
+        return True
+    except Exception as e:
+        logger.error(f"Error checking port owner: {e}")
+        return False
 
 if __name__ == "__main__":
     main() 
