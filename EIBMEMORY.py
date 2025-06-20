@@ -1111,6 +1111,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     market_closed_warning_shown = False
     last_status_time = 0
     last_manual_check = 0
+    initial_sync_done = False  # Flag to track initial sync
     
     while True:  # Infinite loop - never stops
         try:
@@ -1126,6 +1127,14 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
             # Get current REFs from received data
             current_trades = get_current_trade_data()
             current_refs = {trade['REF'] for trade in current_trades}
+            
+            # Special handling for first data receipt after startup
+            if not initial_sync_done and current_trades:
+                logger.info("First data received after startup - syncing with existing positions")
+                # Update known_refs with current MT5 positions to prevent reopening
+                known_refs = set(trade_manager.active_trades.keys())
+                initial_sync_done = True
+                logger.info(f"Initial sync complete - tracking {len(known_refs)} existing positions")
             
             # Find new trades (REFs that weren't there before)
             new_refs = current_refs - known_refs
@@ -1144,23 +1153,27 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 # Execute new trades on Bitcoin INSTANTLY
                 for trade in current_trades:
                     if trade['REF'] in new_refs:
-                        logger.info(f"Processing {trade['REF']} on BITCOIN (original symbol: {trade['Symbol']})")
-                        result = trade_manager.execute_trade_with_retry(trade)
-                        if result is None and tick is None:
-                            logger.info(f"Trade {trade['REF']} queued - will execute when market opens")
-                        # ULTRA-FAST - NO DELAY
+                        # Double check this isn't an existing position
+                        if trade['REF'] not in trade_manager.active_trades:
+                            logger.info(f"Processing {trade['REF']} on BITCOIN (original symbol: {trade['Symbol']})")
+                            result = trade_manager.execute_trade_with_retry(trade)
+                            if result is None and tick is None:
+                                logger.info(f"Trade {trade['REF']} queued - will execute when market opens")
+                        else:
+                            logger.info(f"Trade {trade['REF']} already exists in MT5, skipping execution")
             
             # Check which active trades are no longer in the received data
             active_refs = set(trade_manager.active_trades.keys())
             disappeared_refs = active_refs - current_refs
             
-            # Close trades for disappeared REFs INSTANTLY
-            for ref in disappeared_refs:
-                logger.info(f"REF {ref} no longer in received data - closing Bitcoin trade...")
-                success = trade_manager.close_trade_with_retry(ref)
-                if not success:
-                    logger.warning(f"Could not close trade {ref} - may have been closed manually or market is closed")
-                # ULTRA-FAST - NO DELAY
+            # Only process disappeared trades after initial sync
+            if initial_sync_done:
+                # Close trades for disappeared REFs INSTANTLY
+                for ref in disappeared_refs:
+                    logger.info(f"REF {ref} no longer in received data - closing Bitcoin trade...")
+                    success = trade_manager.close_trade_with_retry(ref)
+                    if not success:
+                        logger.warning(f"Could not close trade {ref} - may have been closed manually or market is closed")
             
             # Update known REFs
             known_refs = current_refs.copy()
@@ -1176,6 +1189,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 logger.info(f"REFs in received data: {len(current_refs)}")
                 logger.info(f"Manually closed REFs: {len(trade_manager.manually_closed_refs)}")
                 logger.info(f"Market status: {market_status}")
+                logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
                 logger.info(f"Flask server: http://localhost:3000")
                 logger.info(f"===================")
                 last_status_time = current_time
