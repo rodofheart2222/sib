@@ -39,7 +39,7 @@ MAX_MEMORY_PERCENT = 85  # Maximum memory percentage before action
 MONITORED_PROCESSES = ["UiRobot.exe"]  # List of processes to monitor
 MEMORY_WARNING_THRESHOLD = 75  # Warning threshold percentage
 UIROBOT_CHECK_INTERVAL = 5  # Check UiRobot every 5 seconds
-UIROBOT_INITIAL_WAIT = 120  # Wait 2 minutes before capturing command line
+UIROBOT_INITIAL_WAIT = 90  # Wait 2 minutes before capturing command line
 
 # Port configuration
 PORT = 3000  # We will only use port 3000
@@ -48,6 +48,9 @@ PORT_LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'port_
 # Single instance lock file
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eibmemory.lock')
 PORT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eibmemory.port')
+
+# Add these constants
+CMDLINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uirobot_cmdline.txt')
 
 def find_free_port():
     """Find a free port in the range 3000-3999"""
@@ -145,8 +148,35 @@ def cleanup_lock_file():
     except:
         pass
 
+def save_cmdline(cmdline):
+    """Save UiRobot command line arguments to file"""
+    try:
+        with open(CMDLINE_FILE, 'w') as f:
+            if cmdline:
+                f.write('\n'.join(cmdline))
+    except Exception as e:
+        logger.error(f"Error saving command line: {e}")
+
+def load_cmdline():
+    """Load saved UiRobot command line arguments"""
+    try:
+        if os.path.exists(CMDLINE_FILE):
+            with open(CMDLINE_FILE, 'r') as f:
+                lines = f.read().splitlines()
+                if lines:
+                    return lines
+    except Exception as e:
+        logger.error(f"Error loading command line: {e}")
+    return None
+
 def get_uirobot_cmdline():
-    """Get UiRobot.exe command line arguments"""
+    """Get UiRobot.exe command line arguments - only once"""
+    # First try to load saved command line
+    saved_cmdline = load_cmdline()
+    if saved_cmdline:
+        logger.info("Using saved UiRobot command line arguments")
+        return saved_cmdline
+        
     try:
         for proc in psutil.process_iter(['name', 'cmdline']):
             if proc.info['name'] == 'UiRobot.exe':
@@ -163,6 +193,10 @@ def get_uirobot_cmdline():
                                 parts[-1] = str(PORT)
                                 arg = ':'.join(parts)
                         new_args.append(arg)
+                    
+                    # Save the command line for future use
+                    save_cmdline(new_args)
+                    logger.info(f"Captured and saved UiRobot command line: {new_args}")
                     return new_args
         return []
     except Exception as e:
@@ -187,16 +221,21 @@ class UiRobotMonitor:
         return False
         
     def capture_cmdline(self):
-        """Capture UiRobot command line after initial wait"""
+        """Capture UiRobot command line after initial wait - only once"""
         if not self.initial_wait_complete:
             elapsed = time.time() - self.start_time
             if elapsed >= UIROBOT_INITIAL_WAIT:
                 logger.info("Initial 2-minute wait complete - capturing UiRobot command line")
                 self.captured_cmdline = get_uirobot_cmdline()
                 if self.captured_cmdline:
-                    logger.info(f"Captured UiRobot arguments: {self.captured_cmdline}")
+                    logger.info(f"Using command line arguments: {self.captured_cmdline}")
                 else:
-                    logger.warning("No command line arguments found for UiRobot")
+                    # Try to load saved command line as fallback
+                    self.captured_cmdline = load_cmdline()
+                    if self.captured_cmdline:
+                        logger.info(f"Using previously saved command line: {self.captured_cmdline}")
+                    else:
+                        logger.warning("No command line arguments found for UiRobot")
                 self.initial_wait_complete = True
                 
     def restart_uirobot(self):
@@ -227,8 +266,12 @@ class UiRobotMonitor:
                     except:
                         pass
                         
-            # Use captured command line if available, otherwise use empty list
-            cmdline = self.captured_cmdline if self.captured_cmdline else []
+            # Use captured command line if available, otherwise try to load saved
+            cmdline = self.captured_cmdline
+            if not cmdline:
+                cmdline = load_cmdline()
+            if not cmdline:
+                cmdline = []
             
             # Start new UiRobot process
             subprocess.Popen([uirobot_path] + cmdline)
@@ -1582,8 +1625,21 @@ def display_trades(trades):
     print(f"{'-'*80}")
     print(f"Note: All trades above will be executed on BITCOIN ({TRADING_SYMBOL}) regardless of original symbol")
 
+def cleanup_files():
+    """Cleanup all lock and state files on exit"""
+    try:
+        files_to_cleanup = [LOCK_FILE, PORT_LOCK_FILE, CMDLINE_FILE]
+        for file in files_to_cleanup:
+            if os.path.exists(file):
+                os.remove(file)
+    except:
+        pass
+
 def main():
     """Main execution function - NEVER STOPS - ULTRA-FAST (0.1ms)"""
+    # Register cleanup for all files
+    atexit.register(cleanup_files)
+    
     # Ensure single instance
     if not ensure_single_instance():
         sys.exit(1)
