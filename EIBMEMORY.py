@@ -16,9 +16,11 @@ from collections import deque
 from typing import Dict, Set, Deque, Optional
 import socket
 from concurrent.futures import ThreadPoolExecutor
+import psutil  # Add at top with other imports
+import subprocess
+import atexit
 
 # Setup advanced logging
-
 logger = logging.getLogger(__name__)
 
 # Constants for ultra-reliable execution
@@ -28,6 +30,135 @@ MARKET_CHECK_INTERVAL = 0.5  # Check market status every 500ms
 CONNECTION_CHECK_INTERVAL = 1.0  # Check connection every 1 second
 MAX_QUEUE_SIZE = 1000
 EXECUTOR_THREADS = 4
+
+# Add these constants near other constants
+MEMORY_CHECK_INTERVAL = 5  # Check every 5 seconds
+MAX_MEMORY_PERCENT = 85  # Maximum memory percentage before action
+MONITORED_PROCESSES = ["UiRobot.exe"]  # List of processes to monitor
+MEMORY_WARNING_THRESHOLD = 75  # Warning threshold percentage
+UIROBOT_CHECK_INTERVAL = 5  # Check UiRobot every 5 seconds
+
+# Single instance lock file
+LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'eibmemory.lock')
+
+# Store original command line arguments
+ORIGINAL_ARGS = sys.argv[1:]
+
+def ensure_single_instance():
+    """Ensure only one instance of the script runs at a time"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            # Check if process is still running
+            with open(LOCK_FILE, 'r') as f:
+                old_pid = int(f.read().strip())
+                try:
+                    # Check if process exists
+                    process = psutil.Process(old_pid)
+                    if process.name().endswith('.py') or process.name().endswith('.exe'):
+                        logger.error(f"Another instance is already running (PID: {old_pid})")
+                        sys.exit(1)
+                except psutil.NoSuchProcess:
+                    # Process doesn't exist, we can continue
+                    pass
+        
+        # Write our PID to lock file
+        with open(LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+            
+        # Register cleanup on exit
+        atexit.register(cleanup_lock_file)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in single instance check: {e}")
+        sys.exit(1)
+
+def cleanup_lock_file():
+    """Remove lock file on exit"""
+    try:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except:
+        pass
+
+def restart_uirobot(command_line_args):
+    """Restart UiRobot.exe with same command line arguments"""
+    try:
+        # Find UiRobot.exe path - assuming it's in a standard location
+        uirobot_paths = [
+            r"C:\Program Files\UiPath\Studio\UiRobot.exe",
+            r"C:\Program Files (x86)\UiPath\Studio\UiRobot.exe"
+        ]
+        
+        uirobot_path = None
+        for path in uirobot_paths:
+            if os.path.exists(path):
+                uirobot_path = path
+                break
+                
+        if not uirobot_path:
+            logger.error("UiRobot.exe not found in standard locations")
+            return False
+            
+        # Kill any existing UiRobot processes
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] == 'UiRobot.exe':
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except:
+                    pass
+                    
+        # Start new UiRobot process
+        subprocess.Popen([uirobot_path] + command_line_args)
+        logger.info(f"Started UiRobot.exe with args: {command_line_args}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error restarting UiRobot: {e}")
+        return False
+
+class UiRobotMonitor:
+    def __init__(self, command_line_args):
+        self.command_line_args = command_line_args
+        self.monitoring = True
+        self.last_restart = 0
+        self.restart_count = 0
+        self.max_restarts = 5  # Maximum restarts per hour
+        
+    def is_uirobot_running(self):
+        """Check if UiRobot is running"""
+        for proc in psutil.process_iter(['name']):
+            if proc.info['name'] == 'UiRobot.exe':
+                return True
+        return False
+        
+    def monitor_uirobot(self):
+        """Monitor UiRobot and restart if needed"""
+        while self.monitoring:
+            try:
+                if not self.is_uirobot_running():
+                    current_time = time.time()
+                    # Reset restart count if more than an hour has passed
+                    if current_time - self.last_restart > 3600:
+                        self.restart_count = 0
+                        
+                    if self.restart_count < self.max_restarts:
+                        logger.warning("UiRobot.exe not running - attempting restart")
+                        if restart_uirobot(self.command_line_args):
+                            self.last_restart = current_time
+                            self.restart_count += 1
+                            logger.info(f"UiRobot.exe restarted (attempt {self.restart_count})")
+                        else:
+                            logger.error("Failed to restart UiRobot.exe")
+                    else:
+                        logger.error("Maximum restart attempts reached - manual intervention required")
+                        
+            except Exception as e:
+                logger.error(f"Error in UiRobot monitor: {e}")
+                
+            time.sleep(UIROBOT_CHECK_INTERVAL)
 
 # Global trade queue for ultra-fast processing
 trade_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
@@ -1097,6 +1228,89 @@ def get_current_trade_data():
     with data_lock:
         return received_trade_data.copy()  # Return a copy to avoid thread issues
 
+class ProcessMemoryMonitor:
+    def __init__(self):
+        self.monitoring = True
+        self.monitored_processes = MONITORED_PROCESSES
+        self.max_memory_percent = MAX_MEMORY_PERCENT
+        self.warning_threshold = MEMORY_WARNING_THRESHOLD
+        
+    def get_process_memory_info(self, process_name):
+        """Get memory usage for a specific process"""
+        try:
+            for proc in psutil.process_iter(['name', 'memory_percent']):
+                if proc.info['name'] == process_name:
+                    return {
+                        'pid': proc.pid,
+                        'memory_percent': proc.info['memory_percent'],
+                        'memory_mb': proc.memory_info().rss / (1024 * 1024)  # Convert to MB
+                    }
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+        return None
+        
+    def terminate_process(self, pid):
+        """Safely terminate a process"""
+        try:
+            process = psutil.Process(pid)
+            process_name = process.name()
+            logger.warning(f"Terminating process {process_name} (PID: {pid}) due to high memory usage")
+            process.terminate()
+            process.wait(timeout=3)  # Wait for process to terminate
+            logger.info(f"Successfully terminated process {process_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error terminating process (PID: {pid}): {e}")
+            return False
+            
+    def monitor_processes(self):
+        """Main monitoring loop"""
+        logger.info("Starting process memory monitoring...")
+        logger.info(f"Monitoring processes: {', '.join(self.monitored_processes)}")
+        logger.info(f"Memory threshold: {self.max_memory_percent}%")
+        logger.info(f"Warning threshold: {self.warning_threshold}%")
+        
+        while self.monitoring:
+            try:
+                # Get system memory info
+                system_memory = psutil.virtual_memory()
+                system_memory_used = system_memory.percent
+                
+                if system_memory_used > self.warning_threshold:
+                    logger.warning(f"System memory usage high: {system_memory_used:.1f}%")
+                
+                # Check each monitored process
+                for process_name in self.monitored_processes:
+                    process_info = self.get_process_memory_info(process_name)
+                    
+                    if process_info:
+                        memory_percent = process_info['memory_percent']
+                        memory_mb = process_info['memory_mb']
+                        pid = process_info['pid']
+                        
+                        logger.info(f"Process {process_name} (PID: {pid}) memory usage: {memory_mb:.1f}MB ({memory_percent:.1f}%)")
+                        
+                        if memory_percent > self.max_memory_percent:
+                            logger.warning(f"Process {process_name} exceeded memory threshold ({memory_percent:.1f}% > {self.max_memory_percent}%)")
+                            if self.terminate_process(pid):
+                                logger.info(f"Successfully terminated {process_name} due to high memory usage")
+                            else:
+                                logger.error(f"Failed to terminate {process_name}")
+                        elif memory_percent > self.warning_threshold:
+                            logger.warning(f"Process {process_name} memory usage warning: {memory_percent:.1f}%")
+                    
+            except Exception as e:
+                logger.error(f"Error in process memory monitoring: {e}")
+            
+            time.sleep(MEMORY_CHECK_INTERVAL)
+
+def start_memory_monitor():
+    """Start the memory monitoring thread"""
+    monitor = ProcessMemoryMonitor()
+    memory_thread = threading.Thread(target=monitor.monitor_processes, daemon=True)
+    memory_thread.start()
+    return monitor
+
 def continuous_monitor_and_execute(trade_manager, check_interval=1):
     """Continuously monitor received trade data and handle new/disappeared trades - IMPROVED RELIABILITY"""
     logger.info(f"Starting reliable monitoring of received POST data (100ms intervals)")
@@ -1112,6 +1326,14 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     last_status_time = 0
     last_manual_check = 0
     initial_sync_done = False  # Flag to track initial sync
+    
+    # Start memory monitoring
+    memory_monitor = start_memory_monitor()
+    
+    # Start UiRobot monitoring
+    uirobot_monitor = UiRobotMonitor(ORIGINAL_ARGS)
+    uirobot_thread = threading.Thread(target=uirobot_monitor.monitor_uirobot, daemon=True)
+    uirobot_thread.start()
     
     while True:  # Infinite loop - never stops
         try:
@@ -1131,7 +1353,6 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
             # Special handling for first data receipt after startup
             if not initial_sync_done and current_trades:
                 logger.info("First data received after startup - syncing with existing positions")
-                # Update known_refs with current MT5 positions to prevent reopening
                 known_refs = set(trade_manager.active_trades.keys())
                 initial_sync_done = True
                 logger.info(f"Initial sync complete - tracking {len(known_refs)} existing positions")
@@ -1191,6 +1412,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 logger.info(f"Market status: {market_status}")
                 logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
                 logger.info(f"Flask server: http://localhost:3000")
+                logger.info(f"UiRobot status: {'RUNNING' if uirobot_monitor.is_uirobot_running() else 'NOT RUNNING'}")
                 logger.info(f"===================")
                 last_status_time = current_time
             
@@ -1236,6 +1458,10 @@ def display_trades(trades):
 
 def main():
     """Main execution function - NEVER STOPS - ULTRA-FAST (0.1ms)"""
+    # Ensure single instance
+    if not ensure_single_instance():
+        sys.exit(1)
+        
     print("\n" + "="*70)
     print("=== MT5 CONTINUOUS BITCOIN TRADING SYSTEM (Flask POST) ===")
     print("="*70)
