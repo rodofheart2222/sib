@@ -230,7 +230,6 @@ class UiRobotMonitor:
         self.last_restart = 0
         self.restart_count = 0
         self.captured_cmdline = None
-        self.last_cmdline_check = 0
         
     def is_uirobot_running(self):
         """Check if UiRobot is running"""
@@ -240,18 +239,11 @@ class UiRobotMonitor:
                     return True
             return False
         except:
-            return False  # Assume not running if we can't check
+            return False
         
     def capture_cmdline(self):
-        """Continuously try to capture command line - no waiting"""
+        """Continuously try to capture command line - ZERO DELAY"""
         try:
-            # Only check every second to avoid excessive CPU usage
-            current_time = time.time()
-            if current_time - self.last_cmdline_check < 1:
-                return
-                
-            self.last_cmdline_check = current_time
-            
             # Always try to capture if UiRobot is running
             if self.is_uirobot_running():
                 new_cmdline = get_uirobot_cmdline()
@@ -272,10 +264,9 @@ class UiRobotMonitor:
                     
         except Exception as e:
             logger.error(f"Error capturing command line: {e}")
-            # Continue even if capture fails
                 
     def restart_uirobot(self):
-        """Restart UiRobot.exe with captured command line - NEVER GIVE UP"""
+        """Restart UiRobot.exe with captured command line - ZERO DELAY"""
         while True:  # Keep trying forever
             try:
                 # Find UiRobot.exe path
@@ -291,21 +282,14 @@ class UiRobotMonitor:
                         break
                         
                 if not uirobot_path:
-                    logger.error("UiRobot.exe not found - retrying in 5 seconds...")
-                    time.sleep(5)
-                    continue  # Keep trying
+                    logger.error("UiRobot.exe not found - retrying immediately")
+                    continue  # Instant retry
                     
                 # Kill all UiPath processes including UiPath.Executor.exe
-                retry_count = 0
-                while retry_count < 3:  # Try killing processes up to 3 times
-                    logger.info("Terminating all UiPath processes...")
-                    killed_processes = kill_uipath_processes()
-                    if killed_processes:
-                        logger.info(f"Successfully terminated: {', '.join(killed_processes)}")
-                        time.sleep(2)  # Give processes time to fully terminate
-                        break
-                    retry_count += 1
-                    time.sleep(1)
+                logger.info("Terminating all UiPath processes...")
+                killed_processes = kill_uipath_processes()
+                if killed_processes:
+                    logger.info(f"Successfully terminated: {', '.join(killed_processes)}")
                 
                 # Use captured command line if available, otherwise try to load saved
                 cmdline = self.captured_cmdline
@@ -318,6 +302,15 @@ class UiRobotMonitor:
                 subprocess.Popen([uirobot_path] + cmdline)
                 logger.info(f"Started UiRobot.exe with args: {cmdline}")
                 
+                # Instantly try to verify and capture
+                if self.is_uirobot_running():
+                    self.capture_cmdline()
+                    return True
+                
+                logger.error("UiRobot.exe failed to start - retrying immediately")
+                continue  # Instant retry
+                
+            except Exception as e:
                 # Wait for process to start and immediately try to capture new command line
                 for _ in range(10):  # Try for 10 seconds
                     time.sleep(1)
