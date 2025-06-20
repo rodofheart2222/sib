@@ -230,8 +230,7 @@ class UiRobotMonitor:
         self.last_restart = 0
         self.restart_count = 0
         self.captured_cmdline = None
-        self.initial_wait_complete = False
-        self.start_time = time.time()
+        self.last_cmdline_check = 0
         
     def is_uirobot_running(self):
         """Check if UiRobot is running"""
@@ -244,23 +243,33 @@ class UiRobotMonitor:
             return False  # Assume not running if we can't check
         
     def capture_cmdline(self):
-        """Capture UiRobot command line after initial wait - only once"""
+        """Continuously try to capture command line - no waiting"""
         try:
-            if not self.initial_wait_complete:
-                elapsed = time.time() - self.start_time
-                if elapsed >= UIROBOT_INITIAL_WAIT:
-                    logger.info("Initial wait complete - capturing UiRobot command line")
-                    self.captured_cmdline = get_uirobot_cmdline()
-                    if self.captured_cmdline:
-                        logger.info(f"Using command line arguments: {self.captured_cmdline}")
-                    else:
-                        # Try to load saved command line as fallback
-                        self.captured_cmdline = load_cmdline()
-                        if self.captured_cmdline:
-                            logger.info(f"Using previously saved command line: {self.captured_cmdline}")
-                        else:
-                            logger.warning("No command line arguments found for UiRobot")
-                    self.initial_wait_complete = True
+            # Only check every second to avoid excessive CPU usage
+            current_time = time.time()
+            if current_time - self.last_cmdline_check < 1:
+                return
+                
+            self.last_cmdline_check = current_time
+            
+            # Always try to capture if UiRobot is running
+            if self.is_uirobot_running():
+                new_cmdline = get_uirobot_cmdline()
+                
+                if new_cmdline:
+                    # Only update and save if we got new arguments
+                    if new_cmdline != self.captured_cmdline:
+                        self.captured_cmdline = new_cmdline
+                        logger.info(f"Captured new command line arguments: {self.captured_cmdline}")
+                        save_cmdline(self.captured_cmdline)
+                
+                # If we don't have any command line yet, try loading from file
+                elif not self.captured_cmdline:
+                    saved_cmdline = load_cmdline()
+                    if saved_cmdline:
+                        self.captured_cmdline = saved_cmdline
+                        logger.info(f"Loaded saved command line: {self.captured_cmdline}")
+                    
         except Exception as e:
             logger.error(f"Error capturing command line: {e}")
             # Continue even if capture fails
@@ -309,14 +318,18 @@ class UiRobotMonitor:
                 subprocess.Popen([uirobot_path] + cmdline)
                 logger.info(f"Started UiRobot.exe with args: {cmdline}")
                 
-                # Verify process started
-                time.sleep(5)  # Wait for startup
-                if self.is_uirobot_running():
-                    logger.info("UiRobot.exe successfully started and running")
-                    return True
-                else:
-                    logger.error("UiRobot.exe failed to start - retrying...")
-                    continue  # Keep trying
+                # Wait for process to start and immediately try to capture new command line
+                for _ in range(10):  # Try for 10 seconds
+                    time.sleep(1)
+                    if self.is_uirobot_running():
+                        # Try to capture command line immediately
+                        self.capture_cmdline()
+                        if self.captured_cmdline:
+                            logger.info("Successfully captured new command line after restart")
+                        return True
+                
+                logger.error("UiRobot.exe failed to start - retrying...")
+                continue  # Keep trying
                 
             except Exception as e:
                 logger.error(f"Error restarting UiRobot: {e}")
@@ -330,17 +343,11 @@ class UiRobotMonitor:
         
         while True:  # Changed to True - monitor forever
             try:
-                # First, try to capture command line if not done yet
+                # Always try to capture command line
                 self.capture_cmdline()
                 
                 if not self.is_uirobot_running():
                     current_time = time.time()
-                    
-                    # Only attempt restart after initial wait
-                    if not self.initial_wait_complete:
-                        logger.info("Waiting for initial period before monitoring UiRobot")
-                        time.sleep(UIROBOT_CHECK_INTERVAL)
-                        continue
                     
                     # Reset restart count every hour
                     if current_time - self.last_restart > 3600:
