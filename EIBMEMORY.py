@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 5
 RETRY_DELAY = 0.1  # 100ms between retries
 MARKET_CHECK_INTERVAL = 0.5  # Check market status every 500ms
-CONNECTION_CHECK_INTERVAL = 1.0  # Check connection every 1 second
+CONNECTION_CHECK_INTERVAL = 0.1 # Check connection every 1 second
 MAX_QUEUE_SIZE = 1000
 EXECUTOR_THREADS = 4
 
@@ -1765,6 +1765,82 @@ def get_trade_manager():
         _trade_manager = MT5TradeManager(args.lot_percentage / 100.0)
     return _trade_manager
 
+def kill_process_on_port(port):
+    """Kill any process using the specified port"""
+    try:
+        for proc in psutil.process_iter(['pid', 'name', 'connections']):
+            try:
+                connections = proc.connections()
+                for conn in connections:
+                    if hasattr(conn, 'laddr') and hasattr(conn.laddr, 'port') and conn.laddr.port == port:
+                        logger.warning(f"Found process {proc.name()} (PID: {proc.pid}) using port {port}")
+                        if proc.pid != os.getpid():  # Don't kill ourselves
+                            proc.kill()
+                            proc.wait(timeout=5)
+                            logger.info(f"Killed process {proc.name()} to free port {port}")
+                            return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception as e:
+        logger.error(f"Error killing process on port {port}: {e}")
+    return False
+
+def ensure_port_available():
+    """Ensure port 3000 is available, killing any process using it"""
+    try:
+        # Check if port is in use
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        result = sock.connect_ex(('127.0.0.1', PORT))
+        sock.close()
+        
+        if result == 0:  # Port is in use
+            logger.warning(f"Port {PORT} is in use, attempting to free it")
+            if kill_process_on_port(PORT):
+                time.sleep(1)  # Wait for port to be fully released
+                
+        # Create port lock file
+        with open(PORT_LOCK_FILE, 'w') as f:
+            f.write(str(os.getpid()))
+            
+        # Register cleanup
+        atexit.register(cleanup_port_lock)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error ensuring port availability: {e}")
+        return False
+
+def cleanup_port_lock():
+    """Remove port lock file on exit"""
+    try:
+        if os.path.exists(PORT_LOCK_FILE):
+            os.remove(PORT_LOCK_FILE)
+    except:
+        pass
+
+def check_port_owner():
+    """Check if we own the port lock"""
+    try:
+        if os.path.exists(PORT_LOCK_FILE):
+            with open(PORT_LOCK_FILE, 'r') as f:
+                pid = int(f.read().strip())
+                if pid == os.getpid():
+                    return True
+                try:
+                    # Check if process exists
+                    proc = psutil.Process(pid)
+                    if proc.is_running():
+                        logger.error(f"Port 3000 is owned by another process (PID: {pid})")
+                        return False
+                except psutil.NoSuchProcess:
+                    # Process doesn't exist, we can take over
+                    pass
+        return True
+    except Exception as e:
+        logger.error(f"Error checking port owner: {e}")
+        return False
+
 class PortMonitor(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -1789,7 +1865,7 @@ class PortMonitor(threading.Thread):
                     # Check if it's us using the port
                     our_port = False
                     for conn in psutil.Process(os.getpid()).connections():
-                        if conn.laddr.port == PORT:
+                        if hasattr(conn, 'laddr') and hasattr(conn.laddr, 'port') and conn.laddr.port == PORT:
                             our_port = True
                             break
                     
@@ -1801,28 +1877,6 @@ class PortMonitor(threading.Thread):
                 logger.error(f"Error in port monitor: {e}")
                 
             time.sleep(1)  # Check every second
-
-def check_port_owner():
-    """Check if we own the port lock"""
-    try:
-        if os.path.exists(PORT_LOCK_FILE):
-            with open(PORT_LOCK_FILE, 'r') as f:
-                pid = int(f.read().strip())
-                if pid == os.getpid():
-                    return True
-                try:
-                    # Check if process exists
-                    proc = psutil.Process(pid)
-                    if proc.is_running():
-                        logger.error(f"Port 3000 is owned by another process (PID: {pid})")
-                        return False
-                except psutil.NoSuchProcess:
-                    # Process doesn't exist, we can take over
-                    pass
-        return True
-    except Exception as e:
-        logger.error(f"Error checking port owner: {e}")
-        return False
 
 if __name__ == "__main__":
     main() 
