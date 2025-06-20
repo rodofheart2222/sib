@@ -896,6 +896,9 @@ class MT5TradeManager:
                         time.sleep(2)  # Minimal delay for retry
                         continue
                 
+                # Load existing trades from MT5
+                self.load_existing_trades_from_mt5()
+                
                 logger.info(f"BITCOIN symbol {TRADING_SYMBOL} is ready for trading")
                 self.mt5_connected = True
                 return True
@@ -907,6 +910,60 @@ class MT5TradeManager:
         
         logger.error("Failed to initialize MT5 after maximum retries")
         return False
+
+    def load_existing_trades_from_mt5(self):
+        """Load existing trades from MT5 by checking order comments and magic numbers"""
+        try:
+            logger.info("Loading existing trades from MT5...")
+            positions = mt5.positions_get()
+            
+            if positions is None:
+                logger.info("No existing positions found in MT5")
+                return
+            
+            loaded_count = 0
+            for pos in positions:
+                try:
+                    # Check both magic number and comment for REF
+                    ref = None
+                    
+                    # Try to get REF from magic number
+                    if pos.magic > 0:
+                        ref = str(pos.magic)
+                    
+                    # If no magic number, try to extract from comment
+                    if not ref and pos.comment:
+                        # Look for REF pattern in comment (REF123 or similar)
+                        if 'REF' in pos.comment.upper():
+                            ref = pos.comment.upper().replace('REF', '').strip()
+                    
+                    if ref:
+                        # Create trade record
+                        trade_record = {
+                            'ref': ref,
+                            'ticket': pos.ticket,
+                            'symbol': pos.symbol,
+                            'original_symbol': pos.symbol,  # We don't know original, use current
+                            'type': 'Buy' if pos.type == mt5.ORDER_TYPE_BUY else 'Sell',
+                            'volume': pos.volume,
+                            'open_price': pos.price_open,
+                            'magic': pos.magic,
+                            'execution_time': pos.time
+                        }
+                        
+                        self.active_trades[ref] = trade_record
+                        executed_trades[ref] = trade_record
+                        loaded_count += 1
+                        logger.info(f"Loaded existing trade: REF={ref}, Type={trade_record['type']}, Volume={pos.volume}")
+                        
+                except Exception as e:
+                    logger.warning(f"Error processing position {pos.ticket}: {e}")
+                    continue
+            
+            logger.info(f"Successfully loaded {loaded_count} existing trades from MT5")
+            
+        except Exception as e:
+            logger.error(f"Error loading existing trades from MT5: {e}")
     
     def ensure_mt5_connection(self):
         """Ensure MT5 is connected, reconnect if necessary"""
@@ -937,31 +994,37 @@ class MT5TradeManager:
                     self.retry_counts[ref] += 1
                     continue
                 
-                # Check if trade exists
+                # Check if trade exists in our tracking
                 if ref not in self.active_trades:
-                    logger.warning(f"No active trade found for REF: {ref}")
-                    return False
-                
-                trade = self.active_trades[ref]
+                    logger.warning(f"No active trade found for REF: {ref} in our tracking")
+                    # Even if not in our tracking, try to find it in MT5
                 
                 # Get all open positions
                 positions = mt5.positions_get()
                 if positions is None:
-                    logger.warning("No positions found")
+                    logger.warning("No positions found in MT5")
                     return False
                 
-                # Find position by magic number (REF)
+                # Find position by magic number OR comment
                 target_position = None
                 for pos in positions:
+                    # Check magic number first
                     if pos.magic == int(ref):
                         target_position = pos
-                        logger.info(f"Found position to close: Magic={pos.magic}, Volume={pos.volume}")
+                        logger.info(f"Found position by magic number: Magic={pos.magic}, Volume={pos.volume}")
+                        break
+                    
+                    # If no match by magic, check comment
+                    if pos.comment and f"REF{ref}" in pos.comment.upper():
+                        target_position = pos
+                        logger.info(f"Found position by comment: Comment={pos.comment}, Volume={pos.volume}")
                         break
                 
                 if target_position is None:
-                    logger.warning(f"Position with REF {ref} not found - may have been manually closed")
+                    logger.warning(f"Position with REF {ref} not found in MT5 - may have been manually closed")
                     self.manually_closed_refs.add(ref)
-                    del self.active_trades[ref]
+                    if ref in self.active_trades:
+                        del self.active_trades[ref]
                     return False
                 
                 self.trade_status[ref] = TradeStatus.EXECUTING
@@ -994,7 +1057,8 @@ class MT5TradeManager:
                 if result.retcode == mt5.TRADE_RETCODE_DONE:
                     # Success!
                     logger.info(f"Successfully closed trade {ref}")
-                    del self.active_trades[ref]
+                    if ref in self.active_trades:
+                        del self.active_trades[ref]
                     self.trade_status[ref] = TradeStatus.COMPLETED
                     return True
                     
@@ -1012,7 +1076,8 @@ class MT5TradeManager:
                     if result.retcode == mt5.TRADE_RETCODE_DONE:
                         # Success with IOC
                         logger.info(f"Successfully closed trade {ref} with IOC")
-                        del self.active_trades[ref]
+                        if ref in self.active_trades:
+                            del self.active_trades[ref]
                         self.trade_status[ref] = TradeStatus.COMPLETED
                         return True
                 
