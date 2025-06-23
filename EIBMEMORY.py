@@ -6,7 +6,8 @@ import os
 from datetime import datetime
 import threading
 import logging
-from flask import Flask, request, jsonify, g
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 import json
 import urllib.parse
 import argparse
@@ -15,49 +16,326 @@ import queue
 from collections import deque
 from typing import Dict, Set, Deque, Optional
 import socket
-from concurrent.futures import ThreadPoolExecutor
+
 import psutil
 import subprocess
 import atexit
 import random
 import signal
 import requests
-from werkzeug.serving import make_server
-import requests.adapters
-from werkzeug.middleware.proxy_fix import ProxyFix
+import winreg
+import ctypes
 
 # Setup advanced logging
 logger = logging.getLogger(__name__)
 
-# Constants for connection pool
-MAX_WORKERS = 10
-POOL_CONNECTIONS = 100
-POOL_MAXSIZE = 100
-POOL_TIMEOUT = 30
-KEEP_ALIVE = True
+def is_admin():
+    """Check if the script is running with admin privileges"""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
-# Add connection pool for requests
-session = requests.Session()
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=POOL_CONNECTIONS,
-    pool_maxsize=POOL_MAXSIZE,
-    max_retries=3,
-    pool_block=False
-)
-session.mount('http://', adapter)
-session.mount('https://', adapter)
+def disable_auto_restart():
+    """Disable automatic restart through registry modifications"""
+    try:
+        if not is_admin():
+            logger.warning("Script needs admin privileges to modify registry!")
+            return False
 
-def create_app():
-    app = Flask(__name__)
-    app.wsgi_app = ProxyFix(app.wsgi_app)
-    return app
+        # Registry paths to modify
+        reg_paths = [
+            (r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU", "NoAutoRebootWithLoggedOnUsers", 1),
+            (r"SOFTWARE\Policies\Microsoft\Windows NT\Windows Update\Auto Update", "AUOptions", 2),
+            (r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate", "NoAutoUpdate", 1),
+            (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "DisableAutomaticRestartSignOn", 1),
+            (r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate", "SetAutoRestartDeadline", 0),
+            (r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate", "SetAutoRestartNotificationConfig", 0),
+            (r"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings", "AutoRestartNotificationDismiss", 1),
+            (r"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings", "RestartNotificationsAllowed2", 0),
+            (r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update", "AUOptions", 2)
+        ]
 
-app = create_app()
+        success = True
+        for reg_path, name, value in reg_paths:
+            try:
+                # Try HKLM first
+                key = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_WOW64_64KEY | winreg.KEY_WRITE)
+                winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+                winreg.CloseKey(key)
+                logger.info(f"Successfully set {reg_path}\\{name} = {value}")
+            except Exception as e:
+                try:
+                    # Try HKCU if HKLM fails
+                    key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_WRITE)
+                    winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, value)
+                    winreg.CloseKey(key)
+                    logger.info(f"Successfully set HKCU\\{reg_path}\\{name} = {value}")
+                except Exception as e2:
+                    logger.error(f"Failed to set registry key {reg_path}\\{name}: {e2}")
+                    success = False
 
-# Configure Flask server with connection pool
-def start_flask_server():
-    """Start Flask server with connection pooling"""
-    logger.info(f"Starting Flask server with connection pool on localhost:{PORT}...")
+        # Disable Windows Update Service
+        try:
+            subprocess.run(['sc', 'config', 'wuauserv', 'start=', 'disabled'], check=True)
+            subprocess.run(['net', 'stop', 'wuauserv'], check=True)
+            logger.info("Successfully disabled Windows Update Service")
+        except Exception as e:
+            logger.error(f"Failed to disable Windows Update Service: {e}")
+            success = False
+
+        # Disable Automatic Maintenance
+        try:
+            subprocess.run(['reg', 'add', 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\Maintenance', '/v', 'MaintenanceDisabled', '/t', 'REG_DWORD', '/d', '1', '/f'], check=True)
+            logger.info("Successfully disabled Automatic Maintenance")
+        except Exception as e:
+            logger.error(f"Failed to disable Automatic Maintenance: {e}")
+            success = False
+
+        return success
+
+    except Exception as e:
+        logger.error(f"Error modifying registry: {e}")
+        return False
+
+def prevent_system_restart():
+    """Prevent system restart by modifying registry and system settings"""
+    try:
+        logger.info("Attempting to prevent system restarts...")
+        
+        # Check admin privileges
+        if not is_admin():
+            logger.warning("WARNING: Script not running with admin privileges!")
+            logger.warning("Some restart prevention features may not work!")
+            logger.warning("Please run the script as administrator for full functionality")
+        
+        # Disable automatic restarts
+        if disable_auto_restart():
+            logger.info("Successfully configured system to prevent automatic restarts")
+        else:
+            logger.warning("Some restart prevention settings could not be applied")
+            logger.warning("The system may still restart automatically")
+        
+        # Additional system modifications
+        try:
+            # Disable Task Scheduler tasks that might trigger restarts
+            tasks_to_disable = [
+                "\\Microsoft\\Windows\\UpdateOrchestrator\\Reboot",
+                "\\Microsoft\\Windows\\UpdateOrchestrator\\Schedule Scan",
+                "\\Microsoft\\Windows\\UpdateOrchestrator\\USO_UxBroker"
+            ]
+            
+            for task in tasks_to_disable:
+                try:
+                    subprocess.run(['schtasks', '/Change', '/TN', task, '/DISABLE'], check=True)
+                    logger.info(f"Disabled scheduled task: {task}")
+                except:
+                    pass
+                    
+        except Exception as e:
+            logger.error(f"Error modifying system tasks: {e}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in prevent_system_restart: {e}")
+        return False
+
+# Built-in HTTP Server with Threading
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle requests in separate threads"""
+    daemon_threads = True
+    allow_reuse_address = True
+
+class TradingHTTPHandler(BaseHTTPRequestHandler):
+    """Custom HTTP handler for trading system"""
+    
+    def log_message(self, format, *args):
+        """Override to use our logger"""
+        logger.info(f"{self.address_string()} - {format % args}")
+    
+    def send_json_response(self, data, status_code=200):
+        """Send JSON response"""
+        response = json.dumps(data).encode('utf-8')
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(response)))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(response)
+    
+    def do_GET(self):
+        """Handle GET requests"""
+        try:
+            if self.path == '/health':
+                self.handle_health()
+            elif self.path == '/status':
+                self.handle_status()
+            else:
+                self.send_json_response({"error": "Not found"}, 404)
+        except Exception as e:
+            logger.error(f"Error handling GET request: {e}")
+            self.send_json_response({"error": "Internal server error"}, 500)
+    
+    def do_POST(self):
+        """Handle POST requests"""
+        try:
+            if self.path == '/trades':
+                self.handle_trades()
+            elif self.path == '/update_lot_size':
+                self.handle_update_lot_size()
+            else:
+                self.send_json_response({"error": "Not found"}, 404)
+        except Exception as e:
+            logger.error(f"Error handling POST request: {e}")
+            self.send_json_response({"error": "Internal server error"}, 500)
+    
+    def do_OPTIONS(self):
+        """Handle OPTIONS requests for CORS"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+    
+    def handle_health(self):
+        """Handle health check"""
+        response_data = {
+            "status": "healthy",
+            "timestamp": datetime.now().isoformat()
+        }
+        self.send_json_response(response_data)
+    
+    def handle_status(self):
+        """Handle status request"""
+        logger.info("Received GET request to /status")
+        
+        try:
+            with data_lock:
+                trade_count = len(received_trade_data)
+            
+            status_data = {
+                "status": "running",
+                "trades_count": trade_count,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.send_json_response(status_data)
+            
+        except Exception as e:
+            error_msg = f"Error getting status: {str(e)}"
+            logger.warning(error_msg)
+            
+            error_status = {
+                "status": "error",
+                "message": error_msg,
+                "trades_count": 0,
+                "timestamp": datetime.now().isoformat()
+            }
+            self.send_json_response(error_status)
+    
+    def handle_trades(self):
+        """Handle trades POST request"""
+        global received_trade_data
+        
+        logger.info("Received POST request to /trades")
+        
+        data = None
+        error_messages = []
+        
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                post_data = self.rfile.read(content_length)
+                content_type = self.headers.get('Content-Type', '')
+                
+                if 'application/json' in content_type:
+                    data = json.loads(post_data.decode('utf-8'))
+                    logger.info(f"Received JSON data: {data}")
+                else:
+                    # Handle plain text data
+                    text_data = post_data.decode('utf-8')
+                    logger.info(f"Received text data: {text_data}")
+                    
+                    if not text_data.strip():
+                        logger.info("Empty text data received - will close all trades")
+                        data = []
+                    else:
+                        data = parse_text_data(text_data)
+                        logger.info(f"Parsed text to data: {data}")
+            else:
+                logger.info("Empty request received - will close all trades")
+                data = []
+                
+        except Exception as e:
+            error_msg = f"Error parsing request data: {str(e)}"
+            logger.warning(error_msg)
+            error_messages.append(error_msg)
+            data = []
+        
+        # Process trades
+        trades = process_trades(data)
+        
+        # Update global trade data with thread safety
+        try:
+            with data_lock:
+                received_trade_data = trades
+            trade_update_event.set()
+        except Exception as e:
+            logger.error(f"Error updating trade data: {e}")
+        
+        response_data = {
+            "status": "success",
+            "message": f"Processed {len(trades)} trades",
+            "trades_count": len(trades),
+            "warnings": error_messages if error_messages else None
+        }
+        
+        self.send_json_response(response_data)
+    
+    def handle_update_lot_size(self):
+        """Handle lot size update"""
+        try:
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
+            
+            if not data or 'lot_percentage' not in data:
+                self.send_json_response({
+                    "status": "error",
+                    "message": "Missing lot_percentage in request"
+                }, 400)
+                return
+                
+            new_percentage = float(data['lot_percentage'])
+            if not 0 < new_percentage <= 100:
+                self.send_json_response({
+                    "status": "error",
+                    "message": f"Invalid lot percentage {new_percentage}. Must be between 0 and 100"
+                }, 400)
+                return
+                
+            # Get trade manager instance
+            trade_manager = get_trade_manager()
+            if trade_manager.update_lot_size(new_percentage):
+                self.send_json_response({
+                    "status": "success",
+                    "message": f"Lot size updated to {new_percentage}%"
+                })
+            else:
+                self.send_json_response({
+                    "status": "error",
+                    "message": "Failed to update lot size"
+                }, 500)
+                
+        except Exception as e:
+            self.send_json_response({
+                "status": "error",
+                "message": str(e)
+            }, 500)
+
+def start_builtin_server():
+    """Start built-in HTTP server"""
+    logger.info(f"Starting built-in HTTP server on localhost:{PORT}...")
     try:
         # Ensure port is available
         if not ensure_port_available():
@@ -68,37 +346,17 @@ def start_flask_server():
         port_monitor = PortMonitor()
         port_monitor.start()
         
-        # Create server with threading
-        server = make_server('localhost', PORT, app, threaded=True)
+        # Create and start the threaded HTTP server
+        server = ThreadedHTTPServer(('localhost', PORT), TradingHTTPHandler)
+        logger.info(f"Built-in HTTP server running on http://localhost:{PORT}")
+        logger.info("Server started with threading support for maximum performance")
         
-        # Create thread pool for request handling
-        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-        
-        @app.before_request
-        def before_request():
-            if not hasattr(g, 'executor'):
-                g.executor = executor
-        
-        @app.teardown_appcontext
-        def teardown_appcontext(exception=None):
-            executor = getattr(g, 'executor', None)
-            if executor:
-                executor.shutdown(wait=False)
-        
-        # Start server
+        # Start server (this will block)
         server.serve_forever()
         
     except Exception as e:
-        logger.error(f"Error starting Flask server: {e}")
+        logger.error(f"Error starting built-in HTTP server: {e}")
         logger.exception("Full traceback:")
-        
-    finally:
-        # Cleanup
-        try:
-            executor.shutdown(wait=False)
-            server.server_close()
-        except:
-            pass
 
 # Add Xano API constants
 
@@ -479,9 +737,6 @@ pending_trades: Deque = deque(maxlen=MAX_QUEUE_SIZE)
 executed_trades: Dict[str, Dict] = {}
 failed_trades: Set[str] = set()
 
-# Thread pool for parallel trade processing
-trade_executor = ThreadPoolExecutor(max_workers=EXECUTOR_THREADS)
-
 # Connection monitoring
 class ConnectionMonitor:
     def __init__(self):
@@ -532,8 +787,7 @@ class ConnectionMonitor:
                     return True
                     
                 self.reconnect_count += 1
-                time.sleep(1)
-                
+              
             logger.critical("Failed to reconnect to MT5 after maximum attempts")
             return False
             
@@ -553,7 +807,7 @@ class TradeStatus:
 
 # Parse command-line arguments
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='MT5 Bitcoin Trading System with Flask API')
+    parser = argparse.ArgumentParser(description='MT5 Bitcoin Trading System with Built-in HTTP Server')
     parser.add_argument('--lot-percentage', type=float, default=100.0,
                        help='Percentage of lot amount to execute (1-100, default: 100)')
     args = parser.parse_args()
@@ -573,99 +827,32 @@ received_trade_data = []
 data_lock = threading.Lock()
 trade_update_event = threading.Event()  # Event to signal new trade data
 
-# Flask app setup
-app = Flask(__name__)
+# Built-in HTTP server setup - no external dependencies
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 
-# Configure Flask logging
-app.logger.setLevel(logging.INFO)
-
-@app.route('/trades', methods=['POST'])
-def receive_trades():
-    """Receive trade data via POST request with connection pooling"""
-    global received_trade_data
-    
-    logger.info("Received POST request to /trades")
-    
-    # Get executor from context
-    executor = getattr(g, 'executor', None)
-    if not executor:
-        executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-        g.executor = executor
-    
-    data = None
-    error_messages = []
-    
-    try:
-        # Use connection pool for request handling
-        if request.is_json:
-            data = request.get_json()
-            logger.info(f"Received JSON data: {data}")
-        else:
-            # Handle plain text data
-            text_data = request.get_data(as_text=True)
-            logger.info(f"Received text data: {text_data}")
-            
-            if not text_data.strip():
-                logger.info("Empty text data received - will close all trades")
-                data = []  # Empty data means close all trades
-            else:
-                # Parse text data using thread pool
-                future = executor.submit(parse_text_data, text_data)
-                data = future.result(timeout=POOL_TIMEOUT)
-                logger.info(f"Parsed text to data: {data}")
-    except Exception as e:
-        error_msg = f"Error parsing request data: {str(e)}"
-        logger.warning(error_msg)
-        error_messages.append(error_msg)
-        data = []
-    
-    # Process trades using connection pool
-    trades = process_trades_with_pool(data, executor)
-    
-    # Update global trade data with thread safety
-    try:
-        with data_lock:
-            received_trade_data = trades
-        trade_update_event.set()
-    except Exception as e:
-        logger.error(f"Error updating trade data: {e}")
-    
-    response_data = {
-        "status": "success",
-        "message": f"Processed {len(trades)} trades",
-        "trades_count": len(trades),
-        "warnings": error_messages if error_messages else None
-    }
-    
-    return jsonify(response_data), 200
-
-def process_trades_with_pool(data, executor):
-    """Process trades using connection pool"""
+def process_trades(data):
+    """Process trades synchronously"""
     trades = []
-    futures = []
     
     try:
         trade_list = [data] if not isinstance(data, list) else data
         
-        # Submit trade processing to thread pool
+        # Process trades synchronously
         for trade_data in trade_list:
-            futures.append(executor.submit(process_single_trade, trade_data))
-        
-        # Collect results
-        for future in futures:
             try:
-                result = future.result(timeout=POOL_TIMEOUT)
+                result = process_single_trade(trade_data)
                 if result:
                     trades.append(result)
             except Exception as e:
                 logger.error(f"Error processing trade: {e}")
     except Exception as e:
-        logger.error(f"Error in trade pool processing: {e}")
+        logger.error(f"Error in trade processing: {e}")
     
     return trades
 
 def process_single_trade(trade_data):
-    """Process a single trade with connection pooling"""
+    """Process a single trade"""
     try:
         if not trade_data:
             return None
@@ -931,81 +1118,11 @@ def parse_csv_text_data(text_data):
         logger.error(f"Error in parse_csv_text_data: {e}")
         return []
 
-@app.route('/status', methods=['GET'])
-def get_status():
-    """Get current system status with connection pooling"""
-    logger.info("Received GET request to /status")
-    
-    try:
-        # Get executor from context
-        executor = getattr(g, 'executor', None)
-        if not executor:
-            executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-            g.executor = executor
-        
-        # Get trade count using thread pool
-        def get_trade_count():
-            with data_lock:
-                return len(received_trade_data)
-        
-        future = executor.submit(get_trade_count)
-        trade_count = future.result(timeout=POOL_TIMEOUT)
-        
-        status_data = {
-            "status": "running",
-            "trades_count": trade_count,
-            "timestamp": datetime.now().isoformat(),
-            "pool_info": {
-                "active_workers": len(executor._threads),
-                "max_workers": executor._max_workers
-            }
-        }
-        
-        return jsonify(status_data), 200
-        
-    except Exception as e:
-        error_msg = f"Error getting status: {str(e)}"
-        logger.warning(error_msg)
-        
-        error_status = {
-            "status": "error",
-            "message": error_msg,
-            "trades_count": 0,
-            "timestamp": datetime.now().isoformat()
-        }
-        return jsonify(error_status), 200
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint with connection pooling"""
-    try:
-        # Get executor from context
-        executor = getattr(g, 'executor', None)
-        if not executor:
-            executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-            g.executor = executor
-        
-        # Check pool health
-        pool_status = "healthy" if len(executor._threads) < executor._max_workers else "at_capacity"
-        
-        return jsonify({
-            "status": "healthy",
-            "timestamp": datetime.now().isoformat(),
-            "pool_status": pool_status,
-            "active_workers": len(executor._threads),
-            "max_workers": executor._max_workers
-        }), 200
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return jsonify({
-            "status": "error",
-            "message": str(e),
-            "timestamp": datetime.now().isoformat()
-        }), 200
 
-def start_flask_server():
-    """Start Flask server in a separate thread"""
-    logger.info(f"Starting Flask server on localhost:{PORT}...")
+def start_server():
+    """Start built-in HTTP server in a separate thread"""
+    logger.info(f"Starting built-in HTTP server on localhost:{PORT}...")
     try:
         # Ensure port is available
         if not ensure_port_available():
@@ -1016,10 +1133,11 @@ def start_flask_server():
         port_monitor = PortMonitor()
         port_monitor.start()
         
-        # Enable threaded mode for better concurrent handling
-        app.run(host='localhost', port=PORT, debug=False, use_reloader=False, threaded=True)
+        # Start built-in HTTP server with threading
+        server = ThreadedHTTPServer(('localhost', PORT), TradingHTTPHandler)
+        server.serve_forever()
     except Exception as e:
-        logger.error(f"Error starting Flask server: {e}")
+        logger.error(f"Error starting built-in HTTP server: {e}")
         logger.exception("Full traceback:")
 
 class MT5TradeManager:
@@ -1089,7 +1207,7 @@ class MT5TradeManager:
                 # Ensure connection before each attempt
                 if not connection_monitor.ensure_connection():
                     logger.error(f"No connection available for trade {ref}")
-                    time.sleep(RETRY_DELAY)
+                    time.sleep(0.01)  # 10ms delay for connection retry
                     self.retry_counts[ref] += 1
                     continue
                 
@@ -1225,13 +1343,12 @@ class MT5TradeManager:
                 self.retry_counts[ref] += 1
                 self.trade_status[ref] = TradeStatus.RETRYING
                 logger.warning(f"Trade {ref} failed (attempt {self.retry_counts[ref]}): {result.comment}")
-                time.sleep(RETRY_DELAY)
-                
+                  
             except Exception as e:
                 logger.error(f"Error executing trade {ref}: {e}")
                 self.retry_counts[ref] += 1
                 self.trade_status[ref] = TradeStatus.RETRYING
-                time.sleep(RETRY_DELAY)
+           
         
         # All retries failed
         logger.error(f"Failed to execute trade {ref} after {MAX_RETRIES} attempts")
@@ -1355,7 +1472,7 @@ class MT5TradeManager:
                 if not mt5.initialize():
                     logger.error(f"MT5 initialization failed! Error code: {mt5.last_error()}")
                     retry_count += 1
-                    time.sleep(2)  # Minimal delay for retry
+                   # Minimal delay for retry
                     continue
                 
                 logger.info("MT5 initialized successfully")
@@ -1369,7 +1486,7 @@ class MT5TradeManager:
                 if not self.check_auto_trading_enabled():
                     logger.error("Cannot proceed without AutoTrading enabled")
                     retry_count += 1
-                    time.sleep(2)  # Minimal delay for retry
+                    # Minimal delay for retry
                     continue
                 
                 # Ensure Bitcoin symbol is available
@@ -1377,7 +1494,7 @@ class MT5TradeManager:
                 if symbol_info is None:
                     logger.error(f"Bitcoin symbol {TRADING_SYMBOL} not found!")
                     retry_count += 1
-                    time.sleep(2)  # Minimal delay for retry
+                  # Minimal delay for retry
                     continue
                 
                 if not symbol_info.visible:
@@ -1385,7 +1502,7 @@ class MT5TradeManager:
                     if not mt5.symbol_select(TRADING_SYMBOL, True):
                         logger.error(f"Failed to select Bitcoin symbol {TRADING_SYMBOL}")
                         retry_count += 1
-                        time.sleep(2)  # Minimal delay for retry
+                        # Minimal delay for retry
                         continue
                 
                 logger.info(f"BITCOIN symbol {TRADING_SYMBOL} is ready for trading")
@@ -1395,7 +1512,7 @@ class MT5TradeManager:
             except Exception as e:
                 logger.error(f"Error initializing MT5: {e}")
                 retry_count += 1
-                time.sleep(2)  # Minimal delay for retry
+                 # Minimal delay for retry
         
         logger.error("Failed to initialize MT5 after maximum retries")
         return False
@@ -1425,7 +1542,7 @@ class MT5TradeManager:
                 # Ensure connection before each attempt
                 if not connection_monitor.ensure_connection():
                     logger.error(f"No connection available to close trade {ref}")
-                    time.sleep(RETRY_DELAY)
+                
                     self.retry_counts[ref] += 1
                     continue
                 
@@ -1534,13 +1651,13 @@ class MT5TradeManager:
                 self.retry_counts[ref] += 1
                 self.trade_status[ref] = TradeStatus.RETRYING
                 logger.warning(f"Close attempt {self.retry_counts[ref]} failed for trade {ref}: {result.comment}")
-                time.sleep(RETRY_DELAY)
+           
                 
             except Exception as e:
                 logger.error(f"Error closing trade {ref}: {e}")
                 self.retry_counts[ref] += 1
                 self.trade_status[ref] = TradeStatus.RETRYING
-                time.sleep(RETRY_DELAY)
+             
         
         # All retries failed
         logger.error(f"Failed to close trade {ref} after {MAX_RETRIES} attempts")
@@ -1685,7 +1802,7 @@ class ProcessMemoryMonitor:
             except Exception as e:
                 logger.error(f"Error in process memory monitoring: {e}")
             
-            time.sleep(MEMORY_CHECK_INTERVAL)
+          
 
 def start_memory_monitor():
     """Start the memory monitoring thread"""
@@ -1702,7 +1819,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     logger.info("RELIABLE EXECUTION MODE - Optimized for stability")
     logger.info("SYSTEM WILL CONTINUE MONITORING EVEN WHEN MARKET IS CLOSED")
     logger.info("DUPLICATE TRADE PREVENTION AND MANUAL CLOSE DETECTION ENABLED")
-    logger.info("WAITING FOR POST DATA ON http://localhost:{PORT}/trades")
+    logger.info(f"WAITING FOR POST DATA ON http://localhost:{PORT}/trades")
     
     known_refs = set()  # Track REFs we've already processed
     market_closed_warning_shown = False
@@ -1796,24 +1913,24 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 logger.info(f"Manually closed REFs: {len(trade_manager.manually_closed_refs)}")
                 logger.info(f"Market status: {market_status}")
                 logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
-                logger.info(f"Flask server: http://localhost:{PORT}")
+                logger.info(f"Built-in HTTP server: http://localhost:{PORT}")
                 logger.info(f"UiRobot status: {'RUNNING' if uirobot_monitor.is_uirobot_running() else 'NOT RUNNING'}")
                 logger.info(f"===================")
                 last_status_time = current_time
             
             # Ultra-tiny sleep to prevent 100% CPU usage while maintaining ultra-fast response
-            time.sleep(0.1)  # 100ms - more reasonable for MT5 processing and system stability
+            time.sleep(0.01)  # 10ms - optimal for high-frequency trading
             
         except KeyboardInterrupt:
             # Even if user tries to interrupt, continue running
             logger.warning("Interrupt detected but system will CONTINUE RUNNING")
-            time.sleep(0.0001)  # Ultra-tiny delay to prevent CPU overload
+            time.sleep(0.001)  # 1ms delay to prevent CPU overload
             continue
             
         except Exception as e:
             logger.error(f"Error in monitoring loop: {e}")
             logger.info("Continuing monitoring after error...")
-            time.sleep(0.0001)  # Ultra-tiny delay to prevent CPU overload
+            time.sleep(0.001)  # 1ms delay to prevent CPU overload
             continue
 
 def display_trades(trades):
@@ -1856,175 +1973,40 @@ def main():
     # Register cleanup for all files
     atexit.register(cleanup_files)
     
+    # Prevent system restarts
+    prevent_system_restart()
+    
     # Ensure single instance
     if not ensure_single_instance():
         sys.exit(1)
-        
-    # Ensure port 3000 is available
-    if not ensure_port_available():
-        logger.error("Could not secure port 3000")
-        sys.exit(1)
-        
-    print("\n" + "="*70)
-    print("=== MT5 CONTINUOUS BITCOIN TRADING SYSTEM (Flask POST) ===")
-    print("="*70)
     
-    # Parse arguments first
+    # Parse arguments
     args = parse_arguments()
     
-    logger.info("=== MT5 CONTINUOUS BITCOIN TRADING SYSTEM (Flask POST) ===")
-    logger.info("THIS SYSTEM RUNS INDEFINITELY")
-    logger.info(f"ALL TRADES WILL BE EXECUTED ON BITCOIN ({TRADING_SYMBOL})")
-    logger.info("ULTRA-FAST EXECUTION MODE - 0.1ms INTERVALS")
-    logger.info(f"LISTENING FOR POST DATA ON http://localhost:{PORT}/trades")
-    logger.info(f"LOT PERCENTAGE: {args.lot_percentage}% (configured via C# GUI)")
+    # Initialize trade manager
+    trade_manager = MT5TradeManager(args.lot_percentage / 100.0)
+    
+    # Initialize MT5 connection
+    if not trade_manager.initialize_mt5():
+        logger.error("Failed to initialize MT5! Exiting...")
+        sys.exit(1)
+    
+    # Sync existing MT5 positions on startup
+    trade_manager.sync_existing_mt5_positions()
+    
+    # Start monitoring and execution in a separate thread
+    monitor_thread = threading.Thread(
+        target=continuous_monitor_and_execute, 
+        args=(trade_manager,), 
+        daemon=True
+    )
+    monitor_thread.start()
+    
+    # Start the built-in HTTP server (this will block and run forever)
+    logger.info("Starting built-in HTTP server...")
+    start_builtin_server()
 
-    # Start Flask server in a separate thread
-    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
-    flask_thread.start()
-    logger.info("Flask server started on http://localhost:{PORT}")
-    
-    # Wait a moment for Flask to start
-    time.sleep(2)
-    
-    # Outer infinite loop for system restart
-    while True:
-        try:
-            # Initialize MT5 Trade Manager with lot percentage from command line
-            trade_manager = MT5TradeManager(args.lot_percentage / 100.0)
-            
-            print(f"\nLOT SIZE CONFIGURATION: {args.lot_percentage}% (from C# GUI)")
-            print("=" * 50)
-            logger.info(f"Using {args.lot_percentage}% lot execution (configured via C# GUI)")
-            break  # Exit the configuration loop
-            
-        except Exception as e:
-            logger.error(f"Error in configuration: {e}")
-            print("Error occurred, using default 100%")
-            trade_manager = MT5TradeManager(1.0)
-            break
-    
-    # Now start the main system loop
-    while True:  # System restart loop
-        try:
-            print("\n" + "="*50)
-            print("INITIALIZING MT5 CONNECTION...")
-            print("="*50)
-            
-            # Initialize MT5 - keep trying until successful
-            while not trade_manager.initialize_mt5():
-                logger.error("Failed to initialize MT5, retrying instantly...")
-                time.sleep(0.1)  # 100ms delay for MT5 connection issues only
-            
-            # IMPORTANT: Sync existing MT5 positions first
-            trade_manager.sync_existing_mt5_positions()
-            
-            # List any existing positions for debugging
-            trade_manager.list_all_existing_positions()
-            
-            # Check if there's any initial data
-            initial_trades = get_current_trade_data()
-            
-            if initial_trades:
-                # Display found trades
-                display_trades(initial_trades)
-                
-                # Ask user confirmation for initial execution
-                try:
-                    print(f"\nFound {len(initial_trades)} initial trades to execute ON BITCOIN.")
-                    confirm = input("Execute initial trades on BITCOIN? (y/n, default y): ")
-                    
-                    if not confirm.strip() or confirm.lower() == 'y':
-                        logger.info("=== EXECUTING INITIAL TRADES ON BITCOIN ===")
-                        executed_count = 0
-                        skipped_count = 0
-                        
-                        for i, trade in enumerate(initial_trades, 1):
-                            # Skip if we already have this trade from MT5 sync
-                            if trade['REF'] in trade_manager.active_trades:
-                                logger.info(f"Trade {trade['REF']} already exists in MT5, skipping")
-                                skipped_count += 1
-                                continue
-                                
-                            logger.info(f"--- Processing trade {i}/{len(initial_trades)}: REF {trade['REF']} ---")
-                            result = trade_manager.execute_trade_with_retry(trade)
-                            if result:
-                                executed_count += 1
-                                logger.info(f"✅ Trade {i}: REF {trade['REF']} EXECUTED successfully")
-                            else:
-                                skipped_count += 1
-                                logger.warning(f"❌ Trade {i}: REF {trade['REF']} SKIPPED or FAILED")
-                            # ULTRA-FAST - NO DELAY between initial trades
-                        
-                        logger.info(f"=== INITIAL TRADE SUMMARY ===")
-                        logger.info(f"Total trades found: {len(initial_trades)}")
-                        logger.info(f"Successfully executed: {executed_count}")
-                        logger.info(f"Skipped/Failed: {skipped_count}")
-                        logger.info(f"============================")
-                    else:
-                        logger.info("Initial Bitcoin trade execution skipped")
-                        
-                except KeyboardInterrupt:
-                    logger.info("Using default settings and continuing...")
-            else:
-                logger.info("No initial trades found")
-                logger.info("System will monitor for POST data on http://localhost:{PORT}/trades")
-            
-            # Start continuous monitoring (NEVER STOPS - ULTRA-FAST)
-            print("\n" + "="*50)
-            print("STARTING ULTRA-FAST MONITORING (0.1ms)...")
-            print("Flask server running on http://localhost:{PORT}")
-            print("POST trade data to: http://localhost:{PORT}/trades")
-            print("Check status at: http://localhost:{PORT}/status")
-            print("="*50)
-            logger.info("Starting ULTRA-FAST BITCOIN monitoring mode (0.1ms intervals)...")
-            logger.info(f"Using {trade_manager.lot_percentage*100}% lot size (configured via C# GUI)")
-            logger.info("Ready to receive POST data on http://localhost:{PORT}/trades")
-            continuous_monitor_and_execute(trade_manager, 1)
-            
-        except Exception as e:
-            logger.error(f"System error occurred: {e}")
-            logger.info("Restarting system instantly...")
-            time.sleep(0.1)  # 100ms delay for system restart only
-            continue
 
-# Add new endpoint for dynamic lot size updates
-@app.route('/update_lot_size', methods=['POST'])
-def update_lot_size():
-    """Update lot size without restart"""
-    try:
-        data = request.get_json()
-        if not data or 'lot_percentage' not in data:
-            return jsonify({
-                "status": "error",
-                "message": "Missing lot_percentage in request"
-            }), 400
-            
-        new_percentage = float(data['lot_percentage'])
-        if not 0 < new_percentage <= 100:
-            return jsonify({
-                "status": "error",
-                "message": f"Invalid lot percentage {new_percentage}. Must be between 0 and 100"
-            }), 400
-            
-        # Get trade manager instance
-        trade_manager = get_trade_manager()
-        if trade_manager.update_lot_size(new_percentage):
-            return jsonify({
-                "status": "success",
-                "message": f"Lot size updated to {new_percentage}%"
-            }), 200
-        else:
-            return jsonify({
-                "status": "error",
-                "message": "Failed to update lot size"
-            }), 500
-            
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
 
 # Global trade manager instance
 _trade_manager = None
@@ -2067,8 +2049,8 @@ def ensure_port_available():
         
         if result == 0:  # Port is in use
             logger.warning(f"Port {PORT} is in use, attempting to free it")
-            if kill_process_on_port(PORT):
-                time.sleep(1)  # Wait for port to be fully released
+          
+             # Wait for port to be fully released
                 
         # Create port lock file
         with open(PORT_LOCK_FILE, 'w') as f:
@@ -2148,20 +2130,14 @@ class PortMonitor(threading.Thread):
             except Exception as e:
                 logger.error(f"Error in port monitor: {e}")
                 
-            time.sleep(1)  # Check every second
+        
 
 def cleanup_server():
     """Cleanup server resources"""
-    try:
-        # Close all connections in the pool
-        session.close()
-        
-        # Close any remaining sockets
-        for sock in socket.socket(socket.AF_INET, socket.SOCK_STREAM):
-            try:
-                sock.close()
-            except:
-                pass
+    try:                
+        # Close any remaining sockets - this was causing the iteration error
+        # Just log cleanup instead of trying to iterate over socket objects
+        logger.info("Cleaning up server resources...")
                 
     except Exception as e:
         logger.error(f"Error during server cleanup: {e}")
