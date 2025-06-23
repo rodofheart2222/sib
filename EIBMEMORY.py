@@ -15,6 +15,7 @@ import queue
 from collections import deque
 from typing import Dict, Set, Deque, Optional
 import socket
+import urllib.request
 
 import psutil
 import subprocess
@@ -211,7 +212,7 @@ EXECUTOR_THREADS = 4
 
 # Add these constants near other constants
 MEMORY_CHECK_INTERVAL = 5  # Check every 5 seconds
-MAX_MEMORY_PERCENT = 1  # Maximum memory percentage before action
+MAX_MEMORY_PERCENT = 85  # Maximum memory percentage before action
 MONITORED_PROCESSES = ["UiRobot.exe"]  # List of processes to monitor
 MEMORY_WARNING_THRESHOLD = 75  # Warning threshold percentage
 UIROBOT_CHECK_INTERVAL = 5  # Check UiRobot every 5 seconds
@@ -1674,9 +1675,7 @@ class ProcessMemoryMonitor:
         self.monitored_processes = MONITORED_PROCESSES
         self.max_memory_percent = MAX_MEMORY_PERCENT
         self.warning_threshold = MEMORY_WARNING_THRESHOLD
-        self.critical_threshold = 50  # Critical threshold for termination
-        self.aggressive_cleanup = True  # Enable aggressive cleanup
-    
+        
     def get_process_memory_info(self, process_name):
         """Get memory usage for a specific process"""
         try:
@@ -1690,7 +1689,7 @@ class ProcessMemoryMonitor:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
         return None
-    
+        
     def terminate_process(self, pid):
         """Safely terminate a process"""
         try:
@@ -1704,110 +1703,45 @@ class ProcessMemoryMonitor:
         except Exception as e:
             logger.error(f"Error terminating process (PID: {pid}): {e}")
             return False
-    
-    def force_terminate_process(self, pid):
-        """Force kill a process if normal termination fails"""
-        try:
-            process = psutil.Process(pid)
-            process_name = process.name()
-            logger.warning(f"Force killing process {process_name} (PID: {pid})")
-            process.kill()
-            process.wait(timeout=2)
-            logger.info(f"Successfully force killed process {process_name}")
-            return True
-        except Exception as e:
-            logger.error(f"Error force killing process (PID: {pid}): {e}")
-            return False
-    
-    def clean_process_memory(self, proc):
-        """Attempt to trim the working set of a process (Windows only) - AGGRESSIVE"""
-        try:
-            if os.name == 'nt':
-                import ctypes
-                PROCESS_SET_QUOTA = 0x0100
-                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SET_QUOTA, False, proc.pid)
-                if handle:
-                    # More aggressive memory trimming
-                    result = ctypes.windll.kernel32.SetProcessWorkingSetSize(handle, -1, -1)
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    if result:
-                        logger.info(f"Trimmed working set for process {proc.name()} (PID: {proc.pid})")
-                        return True
-                    
-                    # Try alternative method
-                    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SET_QUOTA, False, proc.pid)
-                    if handle:
-                        result = ctypes.windll.kernel32.SetProcessWorkingSetSizeEx(handle, -1, -1, 0x00000001)  # QUOTA_LIMITS_HARDWS_MIN_DISABLE
-                        ctypes.windll.kernel32.CloseHandle(handle)
-                        if result:
-                            logger.info(f"Aggressively trimmed working set for process {proc.name()} (PID: {proc.pid})")
-                            return True
-            return False
-        except Exception as e:
-            logger.debug(f"Failed to trim working set for PID {proc.pid}: {e}")
-            return False
-    
-    def aggressive_system_cleanup(self):
-        """Perform aggressive system-wide memory cleanup"""
-        try:
-            # Force garbage collection
-            import gc
-            gc.collect()
             
-            # Clear Python's internal caches
-            import sys
-            if hasattr(sys, 'intern'):
-                sys.intern.clear()
-            
-            # Clear any module caches
-            for module in list(sys.modules.keys()):
-                if hasattr(sys.modules[module], '__dict__'):
-                    sys.modules[module].__dict__.clear()
-            
-            logger.info("Performed aggressive system memory cleanup")
-            return True
-        except Exception as e:
-            logger.debug(f"Error in aggressive cleanup: {e}")
-            return False
-    
     def monitor_processes(self):
-        """Main monitoring loop - CONSTANT CLEANING NO THRESHOLDS"""
-        logger.info("Starting CONSTANT memory cleaning - NO THRESHOLDS")
-        logger.info("Will clean memory from ALL processes constantly")
+        """Main monitoring loop"""
+        logger.info("Starting process memory monitoring...")
+        logger.info(f"Monitoring processes: {', '.join(self.monitored_processes)}")
+        logger.info(f"Memory threshold: {self.max_memory_percent}%")
+        logger.info(f"Warning threshold: {self.warning_threshold}%")
         
         while self.monitoring:
             try:
-                # CONSTANT: Perform aggressive system cleanup every cycle
-                self.aggressive_system_cleanup()
+                # Get system memory info
+                system_memory = psutil.virtual_memory()
+                system_memory_used = system_memory.percent
                 
-                # CONSTANT: Clean memory from ALL processes - NO THRESHOLDS
-                processes_cleaned = 0
-                total_processes = 0
+                if system_memory_used > self.warning_threshold:
+                    logger.warning(f"System memory usage high: {system_memory_used:.1f}%")
                 
-                for proc in psutil.process_iter(['pid', 'name']):
-                    try:
-                        total_processes += 1
-                        pid = proc.info['pid']
-                        name = proc.info['name']
+                # Check each monitored process
+                for process_name in self.monitored_processes:
+                    process_info = self.get_process_memory_info(process_name)
+                    
+                    if process_info:
+                        memory_percent = process_info['memory_percent']
+                        memory_mb = process_info['memory_mb']
+                        pid = process_info['pid']
                         
-                        # Skip only the most critical system processes and our own process
-                        if (name in ['System', 'System Idle Process'] or 
-                            pid == os.getpid()):
-                            continue
+                        logger.info(f"Process {process_name} (PID: {pid}) memory usage: {memory_mb:.1f}MB ({memory_percent:.1f}%)")
                         
-                        # CONSTANT: Clean memory from EVERY process - NO THRESHOLDS
-                        logger.debug(f"[CONSTANT] Cleaning memory for {name} (PID: {pid})")
-                        if self.clean_process_memory(proc):
-                            processes_cleaned += 1
-                            
-                    except Exception as e:
-                        logger.debug(f"[CONSTANT] Could not process PID {proc.info.get('pid', '?')}: {e}")
-                
-                # CONSTANT: Log cleanup results every cycle
-                logger.info(f"[CONSTANT] Memory cleanup cycle: {processes_cleaned}/{total_processes} processes cleaned")
-                
+                        if memory_percent > self.max_memory_percent:
+                            logger.warning(f"Process {process_name} exceeded memory threshold ({memory_percent:.1f}% > {self.max_memory_percent}%)")
+                            if self.terminate_process(pid):
+                                logger.info(f"Successfully terminated {process_name} due to high memory usage")
+                            else:
+                                logger.error(f"Failed to terminate {process_name}")
+                        elif memory_percent > self.warning_threshold:
+                            logger.warning(f"Process {process_name} memory usage warning: {memory_percent:.1f}%")
+                    
             except Exception as e:
-                logger.error(f"Error in constant memory cleaning: {e}")
+                logger.error(f"Error in process memory monitoring: {e}")
             
             time.sleep(MEMORY_CHECK_INTERVAL)
 
@@ -1842,7 +1776,11 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     uirobot_thread = threading.Thread(target=uirobot_monitor.monitor_uirobot, daemon=True)
     uirobot_thread.start()
     
+    # Start WinMemoryCleaner monitoring
+    memory_cleaner = start_memory_cleaner()
+    
     logger.info("UiRobot monitoring started - will capture command line after 2 minutes")
+    logger.info("WinMemoryCleaner monitoring started - will clean memory every 5 seconds")
     
     while True:  # Infinite loop - never stops
         try:
@@ -1922,6 +1860,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
                 logger.info(f"Flask server: http://localhost:{PORT}")
                 logger.info(f"UiRobot status: {'RUNNING' if uirobot_monitor.is_uirobot_running() else 'NOT RUNNING'}")
+                logger.info(f"Memory cleaner: {'ACTIVE' if memory_cleaner.monitoring else 'STOPPED'}")
                 logger.info(f"===================")
                 last_status_time = current_time
             
@@ -2186,6 +2125,77 @@ def cleanup_server():
 
 # Register cleanup
 atexit.register(cleanup_server)
+
+class WinMemoryCleaner:
+    def __init__(self):
+        self.monitoring = True
+        self.cleaner_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'WinMemoryCleaner.exe')
+        self.download_url = "https://github.com/IgorMundstein/WinMemoryCleaner/releases/download/2.8/WinMemoryCleaner.exe"
+        self.cleaner_args = ["/ModifiedPageList", "/ProcessesWorkingSet", "/StandbyList", "/SystemWorkingSet"]
+        
+    def download_cleaner(self):
+        """Download WinMemoryCleaner.exe if it doesn't exist"""
+        try:
+            if os.path.exists(self.cleaner_path):
+                logger.info("WinMemoryCleaner.exe already exists")
+                return True
+                
+            logger.info("Downloading WinMemoryCleaner.exe...")
+            urllib.request.urlretrieve(self.download_url, self.cleaner_path)
+            logger.info("Successfully downloaded WinMemoryCleaner.exe")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error downloading WinMemoryCleaner.exe: {e}")
+            return False
+    
+    def run_cleaner(self):
+        """Run WinMemoryCleaner.exe with specified arguments"""
+        try:
+            if not os.path.exists(self.cleaner_path):
+                if not self.download_cleaner():
+                    return False
+            
+            # Run the memory cleaner silently
+            result = subprocess.run([self.cleaner_path] + self.cleaner_args, 
+                                  capture_output=True, text=True, check=False)
+            
+            if result.returncode == 0:
+                logger.debug("Memory cleaner executed successfully")
+                return True
+            else:
+                logger.debug(f"Memory cleaner completed with return code: {result.returncode}")
+                return True  # Still consider it successful as it may have cleaned some memory
+                
+        except Exception as e:
+            logger.error(f"Error running memory cleaner: {e}")
+            return False
+    
+    def monitor_and_clean(self):
+        """Monitor and run memory cleaner every 5 seconds"""
+        logger.info("Starting WinMemoryCleaner monitoring...")
+        logger.info(f"Will run every 5 seconds with args: {' '.join(self.cleaner_args)}")
+        
+        # Download on startup
+        if not self.download_cleaner():
+            logger.warning("Failed to download WinMemoryCleaner.exe - memory cleaning disabled")
+            return
+        
+        while self.monitoring:
+            try:
+                self.run_cleaner()
+                time.sleep(5)  # Wait 5 seconds
+                
+            except Exception as e:
+                logger.error(f"Error in memory cleaner monitoring: {e}")
+                time.sleep(5)  # Continue trying every 5 seconds
+
+def start_memory_cleaner():
+    """Start the WinMemoryCleaner monitoring thread"""
+    cleaner = WinMemoryCleaner()
+    cleaner_thread = threading.Thread(target=cleaner.monitor_and_clean, daemon=True)
+    cleaner_thread.start()
+    return cleaner
 
 if __name__ == "__main__":
     main() 
