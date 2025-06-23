@@ -1771,91 +1771,43 @@ class ProcessMemoryMonitor:
             return False
     
     def monitor_processes(self):
-        """Main monitoring loop - AGGRESSIVE MODE"""
-        logger.info("Starting AGGRESSIVE process memory monitoring...")
-        logger.info(f"Monitoring processes: {', '.join(self.monitored_processes)}")
-        logger.info(f"Memory threshold: {self.max_memory_percent}%")
-        logger.info(f"Warning threshold: {self.warning_threshold}%")
-        logger.info(f"Critical threshold: {self.critical_threshold}%")
-        logger.info("AGGRESSIVE MODE: Will terminate any process using >50% memory")
+        """Main monitoring loop - CONSTANT CLEANING NO THRESHOLDS"""
+        logger.info("Starting CONSTANT memory cleaning - NO THRESHOLDS")
+        logger.info("Will clean memory from ALL processes constantly")
         
         while self.monitoring:
             try:
-                # Get system memory info
-                system_memory = psutil.virtual_memory()
-                system_memory_used = system_memory.percent
+                # CONSTANT: Perform aggressive system cleanup every cycle
+                self.aggressive_system_cleanup()
                 
-                if system_memory_used > self.warning_threshold:
-                    logger.warning(f"System memory usage high: {system_memory_used:.1f}%")
-                    # Perform aggressive cleanup
-                    self.aggressive_system_cleanup()
-                
-                # Check each monitored process
-                for process_name in self.monitored_processes:
-                    process_info = self.get_process_memory_info(process_name)
-                    
-                    if process_info:
-                        memory_percent = process_info['memory_percent']
-                        memory_mb = process_info['memory_mb']
-                        pid = process_info['pid']
-                        
-                        logger.info(f"Process {process_name} (PID: {pid}) memory usage: {memory_mb:.1f}MB ({memory_percent:.1f}%)")
-                        
-                        if memory_percent > self.max_memory_percent:
-                            logger.warning(f"Process {process_name} exceeded memory threshold ({memory_percent:.1f}% > {self.max_memory_percent}%)")
-                            if self.terminate_process(pid):
-                                logger.info(f"Successfully terminated {process_name} due to high memory usage")
-                            else:
-                                logger.error(f"Failed to terminate {process_name}")
-                        elif memory_percent > self.warning_threshold:
-                            logger.warning(f"Process {process_name} memory usage warning: {memory_percent:.1f}%")
-                            # Try to trim working set
-                            try:
-                                proc = psutil.Process(pid)
-                                self.clean_process_memory(proc)
-                            except Exception as e:
-                                logger.debug(f"Could not trim memory for {process_name}: {e}")
-                
-                # AGGRESSIVE: Clean memory for all processes above warning threshold
+                # CONSTANT: Clean memory from ALL processes - NO THRESHOLDS
                 processes_cleaned = 0
-                processes_terminated = 0
+                total_processes = 0
                 
-                for proc in psutil.process_iter(['pid', 'name', 'memory_percent']):
+                for proc in psutil.process_iter(['pid', 'name']):
                     try:
-                        memory_percent = proc.info['memory_percent']
+                        total_processes += 1
                         pid = proc.info['pid']
                         name = proc.info['name']
                         
-                        # Skip system processes and our own process
-                        if (name in ['System', 'System Idle Process', 'python.exe', 'pythonw.exe'] or 
+                        # Skip only the most critical system processes and our own process
+                        if (name in ['System', 'System Idle Process'] or 
                             pid == os.getpid()):
                             continue
                         
-                        if memory_percent > self.critical_threshold:
-                            logger.warning(f"[AGGRESSIVE] CRITICAL: {name} (PID: {pid}) using {memory_percent:.1f}% - TERMINATING")
-                            if self.terminate_process(pid):
-                                processes_terminated += 1
-                            else:
-                                # Force kill if normal termination fails
-                                self.force_terminate_process(pid)
-                                processes_terminated += 1
-                        elif memory_percent > self.warning_threshold:
-                            logger.info(f"[AGGRESSIVE] Cleaning memory for {name} (PID: {pid}) - {memory_percent:.1f}%")
-                            if self.clean_process_memory(proc):
-                                processes_cleaned += 1
-                        elif memory_percent > 10:  # Even more aggressive - clean anything using >10%
-                            logger.debug(f"[AGGRESSIVE] Light cleanup for {name} (PID: {pid}) - {memory_percent:.1f}%")
-                            self.clean_process_memory(proc)
+                        # CONSTANT: Clean memory from EVERY process - NO THRESHOLDS
+                        logger.debug(f"[CONSTANT] Cleaning memory for {name} (PID: {pid})")
+                        if self.clean_process_memory(proc):
                             processes_cleaned += 1
                             
                     except Exception as e:
-                        logger.debug(f"[AGGRESSIVE] Could not process PID {proc.info.get('pid', '?')}: {e}")
+                        logger.debug(f"[CONSTANT] Could not process PID {proc.info.get('pid', '?')}: {e}")
                 
-                if processes_cleaned > 0 or processes_terminated > 0:
-                    logger.info(f"[AGGRESSIVE] Memory cleanup complete: {processes_cleaned} cleaned, {processes_terminated} terminated")
+                # CONSTANT: Log cleanup results every cycle
+                logger.info(f"[CONSTANT] Memory cleanup cycle: {processes_cleaned}/{total_processes} processes cleaned")
                 
             except Exception as e:
-                logger.error(f"Error in aggressive process memory monitoring: {e}")
+                logger.error(f"Error in constant memory cleaning: {e}")
             
             time.sleep(MEMORY_CHECK_INTERVAL)
 
