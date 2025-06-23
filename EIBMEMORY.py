@@ -1920,8 +1920,17 @@ def main():
     if not ensure_single_instance():
         sys.exit(1)
     
-    # Rest of the existing main() function...
-    # ... existing code ...
+    # Initialize trade manager
+    trade_manager = get_trade_manager()
+    trade_manager.initialize_mt5()
+    trade_manager.sync_existing_mt5_positions()
+
+    # Start Flask server in a thread
+    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
+    flask_thread.start()
+
+    # Start the main monitoring loop (never exits)
+    continuous_monitor_and_execute(trade_manager)
 
 # Add new endpoint for dynamic lot size updates
 @app.route('/update_lot_size', methods=['POST'])
