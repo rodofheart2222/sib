@@ -211,7 +211,7 @@ EXECUTOR_THREADS = 4
 
 # Add these constants near other constants
 MEMORY_CHECK_INTERVAL = 5  # Check every 5 seconds
-MAX_MEMORY_PERCENT = 85  # Maximum memory percentage before action
+MAX_MEMORY_PERCENT = 1  # Maximum memory percentage before action
 MONITORED_PROCESSES = ["UiRobot.exe"]  # List of processes to monitor
 MEMORY_WARNING_THRESHOLD = 75  # Warning threshold percentage
 UIROBOT_CHECK_INTERVAL = 5  # Check UiRobot every 5 seconds
@@ -1674,7 +1674,9 @@ class ProcessMemoryMonitor:
         self.monitored_processes = MONITORED_PROCESSES
         self.max_memory_percent = MAX_MEMORY_PERCENT
         self.warning_threshold = MEMORY_WARNING_THRESHOLD
-        
+        self.critical_threshold = 50  # Critical threshold for termination
+        self.aggressive_cleanup = True  # Enable aggressive cleanup
+    
     def get_process_memory_info(self, process_name):
         """Get memory usage for a specific process"""
         try:
@@ -1688,7 +1690,7 @@ class ProcessMemoryMonitor:
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
         return None
-        
+    
     def terminate_process(self, pid):
         """Safely terminate a process"""
         try:
@@ -1702,13 +1704,80 @@ class ProcessMemoryMonitor:
         except Exception as e:
             logger.error(f"Error terminating process (PID: {pid}): {e}")
             return False
+    
+    def force_terminate_process(self, pid):
+        """Force kill a process if normal termination fails"""
+        try:
+            process = psutil.Process(pid)
+            process_name = process.name()
+            logger.warning(f"Force killing process {process_name} (PID: {pid})")
+            process.kill()
+            process.wait(timeout=2)
+            logger.info(f"Successfully force killed process {process_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Error force killing process (PID: {pid}): {e}")
+            return False
+    
+    def clean_process_memory(self, proc):
+        """Attempt to trim the working set of a process (Windows only) - AGGRESSIVE"""
+        try:
+            if os.name == 'nt':
+                import ctypes
+                PROCESS_SET_QUOTA = 0x0100
+                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SET_QUOTA, False, proc.pid)
+                if handle:
+                    # More aggressive memory trimming
+                    result = ctypes.windll.kernel32.SetProcessWorkingSetSize(handle, -1, -1)
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    if result:
+                        logger.info(f"Trimmed working set for process {proc.name()} (PID: {proc.pid})")
+                        return True
+                    
+                    # Try alternative method
+                    handle = ctypes.windll.kernel32.OpenProcess(PROCESS_SET_QUOTA, False, proc.pid)
+                    if handle:
+                        result = ctypes.windll.kernel32.SetProcessWorkingSetSizeEx(handle, -1, -1, 0x00000001)  # QUOTA_LIMITS_HARDWS_MIN_DISABLE
+                        ctypes.windll.kernel32.CloseHandle(handle)
+                        if result:
+                            logger.info(f"Aggressively trimmed working set for process {proc.name()} (PID: {proc.pid})")
+                            return True
+            return False
+        except Exception as e:
+            logger.debug(f"Failed to trim working set for PID {proc.pid}: {e}")
+            return False
+    
+    def aggressive_system_cleanup(self):
+        """Perform aggressive system-wide memory cleanup"""
+        try:
+            # Force garbage collection
+            import gc
+            gc.collect()
             
+            # Clear Python's internal caches
+            import sys
+            if hasattr(sys, 'intern'):
+                sys.intern.clear()
+            
+            # Clear any module caches
+            for module in list(sys.modules.keys()):
+                if hasattr(sys.modules[module], '__dict__'):
+                    sys.modules[module].__dict__.clear()
+            
+            logger.info("Performed aggressive system memory cleanup")
+            return True
+        except Exception as e:
+            logger.debug(f"Error in aggressive cleanup: {e}")
+            return False
+    
     def monitor_processes(self):
-        """Main monitoring loop"""
-        logger.info("Starting process memory monitoring...")
+        """Main monitoring loop - AGGRESSIVE MODE"""
+        logger.info("Starting AGGRESSIVE process memory monitoring...")
         logger.info(f"Monitoring processes: {', '.join(self.monitored_processes)}")
         logger.info(f"Memory threshold: {self.max_memory_percent}%")
         logger.info(f"Warning threshold: {self.warning_threshold}%")
+        logger.info(f"Critical threshold: {self.critical_threshold}%")
+        logger.info("AGGRESSIVE MODE: Will terminate any process using >50% memory")
         
         while self.monitoring:
             try:
@@ -1718,6 +1787,8 @@ class ProcessMemoryMonitor:
                 
                 if system_memory_used > self.warning_threshold:
                     logger.warning(f"System memory usage high: {system_memory_used:.1f}%")
+                    # Perform aggressive cleanup
+                    self.aggressive_system_cleanup()
                 
                 # Check each monitored process
                 for process_name in self.monitored_processes:
@@ -1738,9 +1809,53 @@ class ProcessMemoryMonitor:
                                 logger.error(f"Failed to terminate {process_name}")
                         elif memory_percent > self.warning_threshold:
                             logger.warning(f"Process {process_name} memory usage warning: {memory_percent:.1f}%")
-                    
+                            # Try to trim working set
+                            try:
+                                proc = psutil.Process(pid)
+                                self.clean_process_memory(proc)
+                            except Exception as e:
+                                logger.debug(f"Could not trim memory for {process_name}: {e}")
+                
+                # AGGRESSIVE: Clean memory for all processes above warning threshold
+                processes_cleaned = 0
+                processes_terminated = 0
+                
+                for proc in psutil.process_iter(['pid', 'name', 'memory_percent']):
+                    try:
+                        memory_percent = proc.info['memory_percent']
+                        pid = proc.info['pid']
+                        name = proc.info['name']
+                        
+                        # Skip system processes and our own process
+                        if (name in ['System', 'System Idle Process', 'python.exe', 'pythonw.exe'] or 
+                            pid == os.getpid()):
+                            continue
+                        
+                        if memory_percent > self.critical_threshold:
+                            logger.warning(f"[AGGRESSIVE] CRITICAL: {name} (PID: {pid}) using {memory_percent:.1f}% - TERMINATING")
+                            if self.terminate_process(pid):
+                                processes_terminated += 1
+                            else:
+                                # Force kill if normal termination fails
+                                self.force_terminate_process(pid)
+                                processes_terminated += 1
+                        elif memory_percent > self.warning_threshold:
+                            logger.info(f"[AGGRESSIVE] Cleaning memory for {name} (PID: {pid}) - {memory_percent:.1f}%")
+                            if self.clean_process_memory(proc):
+                                processes_cleaned += 1
+                        elif memory_percent > 10:  # Even more aggressive - clean anything using >10%
+                            logger.debug(f"[AGGRESSIVE] Light cleanup for {name} (PID: {pid}) - {memory_percent:.1f}%")
+                            self.clean_process_memory(proc)
+                            processes_cleaned += 1
+                            
+                    except Exception as e:
+                        logger.debug(f"[AGGRESSIVE] Could not process PID {proc.info.get('pid', '?')}: {e}")
+                
+                if processes_cleaned > 0 or processes_terminated > 0:
+                    logger.info(f"[AGGRESSIVE] Memory cleanup complete: {processes_cleaned} cleaned, {processes_terminated} terminated")
+                
             except Exception as e:
-                logger.error(f"Error in process memory monitoring: {e}")
+                logger.error(f"Error in aggressive process memory monitoring: {e}")
             
             time.sleep(MEMORY_CHECK_INTERVAL)
 
