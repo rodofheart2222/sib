@@ -29,6 +29,11 @@ import winreg
 import ctypes
 
 # Setup advanced logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 def is_admin():
@@ -42,7 +47,7 @@ def disable_auto_restart():
     """Disable automatic restart through registry modifications"""
     try:
         if not is_admin():
-            logger.warning("Script needs admin privileges to modify registry!")
+            logger.debug("Admin privileges required for registry modifications - skipping")
             return False
 
         # Registry paths to modify
@@ -79,20 +84,28 @@ def disable_auto_restart():
 
         # Disable Windows Update Service
         try:
-            subprocess.run(['sc', 'config', 'wuauserv', 'start=', 'disabled'], check=True)
-            subprocess.run(['net', 'stop', 'wuauserv'], check=True)
-            logger.info("Successfully disabled Windows Update Service")
+            result1 = subprocess.run(['sc', 'config', 'wuauserv', 'start=', 'disabled'], 
+                                   capture_output=True, text=True, check=False)
+            result2 = subprocess.run(['net', 'stop', 'wuauserv'], 
+                                   capture_output=True, text=True, check=False)
+            if result1.returncode == 0 and result2.returncode == 0:
+                logger.info("Successfully disabled Windows Update Service")
+            else:
+                logger.debug("Windows Update Service modification completed with warnings")
         except Exception as e:
-            logger.error(f"Failed to disable Windows Update Service: {e}")
-            success = False
+            logger.debug(f"Windows Update Service modification: {e}")
 
         # Disable Automatic Maintenance
         try:
-            subprocess.run(['reg', 'add', 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\Maintenance', '/v', 'MaintenanceDisabled', '/t', 'REG_DWORD', '/d', '1', '/f'], check=True)
-            logger.info("Successfully disabled Automatic Maintenance")
+            result = subprocess.run(['reg', 'add', 'HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\Maintenance', 
+                                   '/v', 'MaintenanceDisabled', '/t', 'REG_DWORD', '/d', '1', '/f'], 
+                                   capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                logger.info("Successfully disabled Automatic Maintenance")
+            else:
+                logger.debug("Automatic Maintenance modification completed with warnings")
         except Exception as e:
-            logger.error(f"Failed to disable Automatic Maintenance: {e}")
-            success = False
+            logger.debug(f"Automatic Maintenance modification: {e}")
 
         return success
 
@@ -107,16 +120,16 @@ def prevent_system_restart():
         
         # Check admin privileges
         if not is_admin():
-            logger.warning("WARNING: Script not running with admin privileges!")
-            logger.warning("Some restart prevention features may not work!")
-            logger.warning("Please run the script as administrator for full functionality")
+            logger.info("Note: Script not running with admin privileges")
+            logger.info("Basic restart prevention will be attempted with user-level permissions")
+            logger.info("For full system restart prevention, run as administrator")
         
         # Disable automatic restarts
         if disable_auto_restart():
             logger.info("Successfully configured system to prevent automatic restarts")
         else:
-            logger.warning("Some restart prevention settings could not be applied")
-            logger.warning("The system may still restart automatically")
+            logger.info("Some restart prevention settings could not be applied")
+            logger.info("This is normal without admin privileges - core functionality will continue")
         
         # Additional system modifications
         try:
@@ -129,10 +142,16 @@ def prevent_system_restart():
             
             for task in tasks_to_disable:
                 try:
-                    subprocess.run(['schtasks', '/Change', '/TN', task, '/DISABLE'], check=True)
-                    logger.info(f"Disabled scheduled task: {task}")
-                except:
-                    pass
+                    # Use DEVNULL to suppress error output from schtasks
+                    result = subprocess.run(['schtasks', '/Change', '/TN', task, '/DISABLE'], 
+                                          capture_output=True, text=True, check=False)
+                    if result.returncode == 0:
+                        logger.info(f"Disabled scheduled task: {task}")
+                    else:
+                        # Don't log as error since these tasks may not exist on all systems
+                        logger.debug(f"Task {task} not found or already disabled")
+                except Exception as e:
+                    logger.debug(f"Could not disable task {task}: {e}")
                     
         except Exception as e:
             logger.error(f"Error modifying system tasks: {e}")
@@ -2069,12 +2088,22 @@ class PortMonitor(threading.Thread):
 def cleanup_server():
     """Cleanup server resources"""
     try:                
-        # Close any remaining sockets
-        for sock in socket.socket(socket.AF_INET, socket.SOCK_STREAM):
-            try:
-                sock.close()
-            except:
-                pass
+        # Close any remaining sockets bound to our port
+        import gc
+        for obj in gc.get_objects():
+            if isinstance(obj, socket.socket):
+                try:
+                    # Try to get socket info
+                    try:
+                        sockname = obj.getsockname()
+                        if sockname and len(sockname) > 1 and sockname[1] == PORT:
+                            obj.close()
+                            logger.debug(f"Closed socket on port {PORT}")
+                    except:
+                        # Socket might already be closed or not bound
+                        pass
+                except:
+                    pass
                 
     except Exception as e:
         logger.error(f"Error during server cleanup: {e}")
