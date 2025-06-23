@@ -15,7 +15,6 @@ import queue
 from collections import deque
 from typing import Dict, Set, Deque, Optional
 import socket
-import urllib.request
 
 import psutil
 import subprocess
@@ -1776,11 +1775,7 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
     uirobot_thread = threading.Thread(target=uirobot_monitor.monitor_uirobot, daemon=True)
     uirobot_thread.start()
     
-    # Start WinMemoryCleaner monitoring
-    memory_cleaner = start_memory_cleaner()
-    
     logger.info("UiRobot monitoring started - will capture command line after 2 minutes")
-    logger.info("WinMemoryCleaner monitoring started - will clean memory every 5 seconds")
     
     while True:  # Infinite loop - never stops
         try:
@@ -1860,7 +1855,6 @@ def continuous_monitor_and_execute(trade_manager, check_interval=1):
                 logger.info(f"Initial sync status: {'COMPLETE' if initial_sync_done else 'PENDING'}")
                 logger.info(f"Flask server: http://localhost:{PORT}")
                 logger.info(f"UiRobot status: {'RUNNING' if uirobot_monitor.is_uirobot_running() else 'NOT RUNNING'}")
-                logger.info(f"Memory cleaner: {'ACTIVE' if memory_cleaner.monitoring else 'STOPPED'}")
                 logger.info(f"===================")
                 last_status_time = current_time
             
@@ -2126,76 +2120,69 @@ def cleanup_server():
 # Register cleanup
 atexit.register(cleanup_server)
 
-class WinMemoryCleaner:
-    def __init__(self):
-        self.monitoring = True
-        self.cleaner_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'WinMemoryCleaner.exe')
-        self.download_url = "https://github.com/IgorMundstein/WinMemoryCleaner/releases/download/2.8/WinMemoryCleaner.exe"
-        self.cleaner_args = ["/ModifiedPageList", "/ProcessesWorkingSet", "/StandbyList", "/SystemWorkingSet"]
-        
-    def download_cleaner(self):
-        """Download WinMemoryCleaner.exe if it doesn't exist"""
-        try:
-            if os.path.exists(self.cleaner_path):
-                logger.info("WinMemoryCleaner.exe already exists")
-                return True
-                
-            logger.info("Downloading WinMemoryCleaner.exe...")
-            urllib.request.urlretrieve(self.download_url, self.cleaner_path)
-            logger.info("Successfully downloaded WinMemoryCleaner.exe")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error downloading WinMemoryCleaner.exe: {e}")
-            return False
-    
-    def run_cleaner(self):
-        """Run WinMemoryCleaner.exe with specified arguments"""
-        try:
-            if not os.path.exists(self.cleaner_path):
-                if not self.download_cleaner():
-                    return False
-            
-            # Run the memory cleaner silently
-            result = subprocess.run([self.cleaner_path] + self.cleaner_args, 
-                                  capture_output=True, text=True, check=False)
-            
-            if result.returncode == 0:
-                logger.debug("Memory cleaner executed successfully")
-                return True
-            else:
-                logger.debug(f"Memory cleaner completed with return code: {result.returncode}")
-                return True  # Still consider it successful as it may have cleaned some memory
-                
-        except Exception as e:
-            logger.error(f"Error running memory cleaner: {e}")
-            return False
-    
-    def monitor_and_clean(self):
-        """Monitor and run memory cleaner every 5 seconds"""
-        logger.info("Starting WinMemoryCleaner monitoring...")
-        logger.info(f"Will run every 5 seconds with args: {' '.join(self.cleaner_args)}")
-        
-        # Download on startup
-        if not self.download_cleaner():
-            logger.warning("Failed to download WinMemoryCleaner.exe - memory cleaning disabled")
-            return
-        
-        while self.monitoring:
-            try:
-                self.run_cleaner()
-                time.sleep(5)  # Wait 5 seconds
-                
-            except Exception as e:
-                logger.error(f"Error in memory cleaner monitoring: {e}")
-                time.sleep(5)  # Continue trying every 5 seconds
+WINMEMCLEANER_URL = "https://github.com/IgorMundstein/WinMemoryCleaner/releases/download/2.8/WinMemoryCleaner.exe"
+WINMEMCLEANER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "WinMemoryCleaner.exe")
+WINMEMCLEANER_ARGS = [
+    WINMEMCLEANER_PATH,
+    "/ModifiedPageList",
+    "/ProcessesWorkingSet",
+    "/StandbyList",
+    "/SystemWorkingSet"
+]
 
-def start_memory_cleaner():
-    """Start the WinMemoryCleaner monitoring thread"""
-    cleaner = WinMemoryCleaner()
-    cleaner_thread = threading.Thread(target=cleaner.monitor_and_clean, daemon=True)
-    cleaner_thread.start()
-    return cleaner
+
+def download_winmemorycleaner():
+    """Download WinMemoryCleaner.exe if not already present."""
+    if os.path.exists(WINMEMCLEANER_PATH):
+        logger.info("WinMemoryCleaner.exe already exists.")
+        return True
+    try:
+        logger.info(f"Downloading WinMemoryCleaner.exe from {WINMEMCLEANER_URL} ...")
+        response = requests.get(WINMEMCLEANER_URL, stream=True)
+        response.raise_for_status()
+        with open(WINMEMCLEANER_PATH, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        logger.info("WinMemoryCleaner.exe downloaded successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to download WinMemoryCleaner.exe: {e}")
+        return False
+
+def run_winmemorycleaner_periodically():
+    """Run WinMemoryCleaner.exe every 5 seconds in a background thread."""
+    while True:
+        try:
+            logger.info("Running WinMemoryCleaner.exe ...")
+            subprocess.run(WINMEMCLEANER_ARGS, check=False, capture_output=True)
+        except Exception as e:
+            logger.error(f"Error running WinMemoryCleaner.exe: {e}")
+        time.sleep(5)
+
+# In main(), before starting Flask thread, add:
+# download_winmemorycleaner()
+# threading.Thread(target=run_winmemorycleaner_periodically, daemon=True).start()
+
+# ...existing main() code...
+
+def main():
+    """Main execution function - NEVER STOPS - ULTRA-FAST (0.1ms)"""
+    atexit.register(cleanup_files)
+    prevent_system_restart()
+    if not ensure_single_instance():
+        sys.exit(1)
+
+    # Download WinMemoryCleaner and start periodic runner thread
+    if download_winmemorycleaner():
+        threading.Thread(target=run_winmemorycleaner_periodically, daemon=True).start()
+
+    trade_manager = get_trade_manager()
+    trade_manager.initialize_mt5()
+    trade_manager.sync_existing_mt5_positions()
+    flask_thread = threading.Thread(target=start_flask_server, daemon=True)
+    flask_thread.start()
+    continuous_monitor_and_execute(trade_manager)
 
 if __name__ == "__main__":
     main() 
