@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ping Pong Game</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="game-header">
+            <h1>Ping Pong Game</h1>
+            <div class="score-board">
+                <div class="score">
+                    <span class="label">Player</span>
+                    <span id="playerScore">0</span>
+                </div>
+                <div class="score">
+                    <span class="label">AI</span>
+                    <span id="aiScore">0</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="game-area">
+            <canvas id="gameCanvas" width="800" height="400"></canvas>
+        </div>
+        
+        <div class="game-controls">
+            <div class="controls-info">
+                <p><strong>Controls:</strong></p>
+                <p>W/S - Move paddle up/down</p>
+                <p>Space - Pause/Resume</p>
+                <p>Enter - Restart game</p>
+            </div>
+            <div class="game-status">
+                <div id="gameStatus" class="status-message">Press Space to Start</div>
+            </div>
+        </div>
+        
+        <div id="gameOverScreen" class="game-over hidden">
+            <div class="game-over-content">
+                <h2 id="gameOverTitle">Game Over</h2>
+                <p id="gameOverMessage">Player Wins!</p>
+                <button id="restartButton">Play Again</button>
+            </div>
+        </div>
+    </div>
+    
+    <script src="game.js"></script>
+</body>
+</html>
